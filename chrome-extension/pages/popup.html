@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <title>ChatGPT Exporter</title>
+    <link rel="stylesheet" href="../styles/popup.css">
+</head>
+<body>
+    <main>
+        <h1>ChatGPT Exporter</h1>
+        <section id="schedule-state">
+            <p id="next-run">计划状态加载中...</p>
+            <p id="reminder-note" class="note"></p>
+        </section>
+        <div class="actions">
+            <button id="open-dialog-btn">导出</button>
+        </div>
+        <p class="hint">请先打开 chatgpt.com，再导出</p>
+        <footer>
+            <button id="open-options-btn" class="link-btn">打开设置</button>
+        </footer>
+    </main>
+    <script type="module" src="popup.js"></script>
+</body>
+</html>
+

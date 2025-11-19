@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <title>ChatGPT Exporter 设置</title>
+    <link rel="stylesheet" href="../styles/options.css">
+</head>
+<body>
+    <main>
+        <h1>导出与提醒设置</h1>
+        <form id="settings-form">
+            <section>
+                <label for="frequency">提醒频率</label>
+                <select id="frequency" name="frequency">
+                    <option value="off">关闭</option>
+                    <option value="daily">每天</option>
+                    <option value="weekly">每周</option>
+                </select>
+            </section>
+            <section id="time-section">
+                <label for="timeOfDay">提醒时间</label>
+                <input type="time" id="timeOfDay" name="timeOfDay" value="09:00">
+            </section>
+            <section id="weekday-section">
+                <label for="weekday">提醒日（周模式）</label>
+                <select id="weekday" name="weekday">
+                    <option value="1">周一</option>
+                    <option value="2">周二</option>
+                    <option value="3">周三</option>
+                    <option value="4">周四</option>
+                    <option value="5">周五</option>
+                    <option value="6">周六</option>
+                    <option value="0">周日</option>
+                </select>
+            </section>
+            <div class="form-actions">
+                <button type="submit">保存设置</button>
+                <button type="button" id="reset-btn" class="ghost">恢复默认</button>
+            </div>
+            <p id="save-state" role="status"></p>
+        </form>
+    </main>
+    <script type="module" src="options.js"></script>
+</body>
+</html>
+

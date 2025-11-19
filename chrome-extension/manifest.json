@@ -1,0 +1,62 @@
+{
+  "manifest_version": 3,
+  "name": "ChatGPT Universal Exporter",
+  "description": "Auto-export ChatGPT conversations as JSON+Markdown with scheduled reminders.",
+  "version": "0.1.0",
+  "permissions": [
+    "storage",
+    "alarms",
+    "notifications",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "options_page": "pages/options.html",
+  "action": {
+    "default_title": "ChatGPT Exporter",
+    "default_popup": "pages/popup.html"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://*.chatgpt.com/*",
+        "https://chat.openai.com/*",
+        "https://*.openai.com/*"
+      ],
+      "js": [
+        "content/inject-exporter.js",
+        "content/auto-export.js"
+      ],
+      "run_at": "document_end"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "exporter.user.js",
+        "jszip.min.js"
+      ],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://*.chatgpt.com/*",
+        "https://chat.openai.com/*",
+        "https://*.openai.com/*"
+      ]
+    }
+  ]
+}
+

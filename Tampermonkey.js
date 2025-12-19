@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         ChatGPT Universal Exporter (Markdown Support)
-// @version      1.1.0
+// @version      1.2.0
 // @description  User-centric ZIP exporter with multi-ID support. Supports JSON & Markdown formats. Based on ChatGPT Universal Exporter.
 // @author       huhu
 // @match        https://chatgpt.com/*
@@ -16,8 +16,9 @@
 // ==/UserScript==
 
 /* ============================================================
-    v1.1.0 变更 (对话选择与体验优化)
+    v1.2.0 变更 (对话选择与体验优化)
     ------------------------------------------------------------
+    • 新增日期范围筛选，并支持按创建时间/更新时间切换
     • 新增「选择对话导出」与对话筛选/搜索
     • 团队空间流程优化，检测到单一 Workspace 直接进入目标动作
     • 大列表使用「加载更多」提升性能
@@ -95,10 +96,35 @@
     const sleep = ms => new Promise(r => setTimeout(r, ms));
     const jitter = () => BASE_DELAY + Math.random() * JITTER;
     const sanitizeFilename = (name) => name.replace(/[\/\\?%*:|"<>]/g, '-').trim();
-    const formatTimestamp = (seconds) => {
+    const normalizeEpochSeconds = (value) => {
+        if (!value) return 0;
+        if (typeof value === 'number' && Number.isFinite(value)) {
+            return value > 1e12 ? Math.floor(value / 1000) : value;
+        }
+        if (typeof value === 'string') {
+            const parsed = Date.parse(value);
+            if (!Number.isNaN(parsed)) {
+                return Math.floor(parsed / 1000);
+            }
+        }
+        return 0;
+    };
+    const formatTimestamp = (value) => {
+        const seconds = normalizeEpochSeconds(value);
         if (!seconds) return '';
         const date = new Date(seconds * 1000);
         return Number.isNaN(date.getTime()) ? '' : date.toLocaleString();
+    };
+    const parseDateInputToEpoch = (value, isEnd = false) => {
+        if (!value) return null;
+        const parts = value.split('-').map(Number);
+        if (parts.length !== 3 || parts.some(Number.isNaN)) return null;
+        const [year, month, day] = parts;
+        const date = isEnd
+            ? new Date(year, month - 1, day, 23, 59, 59, 999)
+            : new Date(year, month - 1, day, 0, 0, 0, 0);
+        const epochMs = date.getTime();
+        return Number.isNaN(epochMs) ? null : Math.floor(epochMs / 1000);
     };
 
     /**
@@ -431,10 +457,12 @@
         const map = new Map();
         const addEntry = (item, extra = {}) => {
             if (!item?.id) return;
-            const update_time = item.update_time || item.create_time || 0;
+            const create_time = normalizeEpochSeconds(item.create_time || 0);
+            const update_time = normalizeEpochSeconds(item.update_time || item.create_time || 0);
             const entry = {
                 id: item.id,
                 title: item.title || 'Untitled Conversation',
+                create_time,
                 update_time,
                 is_archived: item.is_archived ?? extra.is_archived ?? false,
                 projectId: extra.projectId || null,
@@ -448,6 +476,9 @@
             if (!existing.projectTitle && entry.projectTitle) {
                 existing.projectTitle = entry.projectTitle;
                 existing.projectId = entry.projectId;
+            }
+            if (!existing.create_time && entry.create_time) {
+                existing.create_time = entry.create_time;
             }
             existing.is_archived = existing.is_archived || entry.is_archived;
             if ((entry.update_time || 0) > (existing.update_time || 0)) {
@@ -584,9 +615,12 @@
             query: '',
             scope: 'all',
             archived: 'all',
+            timeField: 'update',
             loading: true,
             pageSize: 100,
-            visibleCount: 100
+            visibleCount: 100,
+            startDate: '',
+            endDate: ''
         };
 
         const renderBase = () => {
@@ -609,6 +643,16 @@
                         <option value="archived">仅已归档</option>
                     </select>
                 </div>
+                <div style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center;">
+                    <select id="filter-time-field" style="padding: 8px; border-radius: 6px; border: 1px solid #ccc;">
+                        <option value="update">按更新时间</option>
+                        <option value="create">按创建时间</option>
+                    </select>
+                    <input id="filter-start-date" type="date" style="padding: 8px; border-radius: 6px; border: 1px solid #ccc;">
+                    <span style="color: #666; font-size: 12px;">至</span>
+                    <input id="filter-end-date" type="date" style="padding: 8px; border-radius: 6px; border: 1px solid #ccc;">
+                    <button id="clear-date-btn" style="padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer;">清空日期</button>
+                </div>
                 <div id="conv-status" style="margin-bottom: 8px; font-size: 12px; color: #666;">正在加载列表...</div>
                 <div id="conv-list" style="max-height: 360px; overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px; background: #fff;"></div>
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 16px;">
@@ -626,6 +670,10 @@
             const searchInput = dialog.querySelector('#conv-search');
             const scopeSelect = dialog.querySelector('#filter-scope');
             const archivedSelect = dialog.querySelector('#filter-archived');
+            const timeFieldSelect = dialog.querySelector('#filter-time-field');
+            const startDateInput = dialog.querySelector('#filter-start-date');
+            const endDateInput = dialog.querySelector('#filter-end-date');
+            const clearDateBtn = dialog.querySelector('#clear-date-btn');
             const selectAllBtn = dialog.querySelector('#select-all-btn');
             const clearAllBtn = dialog.querySelector('#clear-all-btn');
             const backBtn = dialog.querySelector('#back-btn');
@@ -643,6 +691,29 @@
             };
             archivedSelect.onchange = (e) => {
                 state.archived = e.target.value;
+                applyFilters();
+                renderList();
+            };
+            timeFieldSelect.onchange = (e) => {
+                state.timeField = e.target.value;
+                applyFilters();
+                renderList();
+            };
+            startDateInput.onchange = (e) => {
+                state.startDate = e.target.value || '';
+                applyFilters();
+                renderList();
+            };
+            endDateInput.onchange = (e) => {
+                state.endDate = e.target.value || '';
+                applyFilters();
+                renderList();
+            };
+            clearDateBtn.onclick = () => {
+                state.startDate = '';
+                state.endDate = '';
+                startDateInput.value = '';
+                endDateInput.value = '';
                 applyFilters();
                 renderList();
             };
@@ -668,6 +739,8 @@
 
         const applyFilters = () => {
             const query = state.query.trim().toLowerCase();
+            const startBound = parseDateInputToEpoch(state.startDate, false);
+            const endBound = parseDateInputToEpoch(state.endDate, true);
             state.filtered = state.list.filter(item => {
                 const text = `${item.title || ''} ${item.projectTitle || ''} ${item.id || ''}`.toLowerCase();
                 if (query && !text.includes(query)) return false;
@@ -675,6 +748,15 @@
                 if (state.scope === 'root' && item.projectTitle) return false;
                 if (state.archived === 'active' && item.is_archived) return false;
                 if (state.archived === 'archived' && !item.is_archived) return false;
+                if (startBound || endBound) {
+                    const sourceTime = state.timeField === 'create'
+                        ? item.create_time
+                        : item.update_time;
+                    const ts = normalizeEpochSeconds(sourceTime || 0);
+                    if (!ts) return false;
+                    if (startBound && ts < startBound) return false;
+                    if (endBound && ts > endBound) return false;
+                }
                 return true;
             });
             state.visibleCount = state.pageSize;
@@ -743,8 +825,10 @@
                 const meta = document.createElement('div');
                 meta.style.fontSize = '12px';
                 meta.style.color = '#666';
-                const timeLabel = formatTimestamp(item.update_time) || '未知';
-                meta.textContent = `更新: ${timeLabel}`;
+                const timeLabelPrefix = state.timeField === 'create' ? '创建' : '更新';
+                const timeValue = state.timeField === 'create' ? item.create_time : item.update_time;
+                const timeLabel = formatTimestamp(timeValue) || '未知';
+                meta.textContent = `${timeLabelPrefix}: ${timeLabel}`;
 
                 const tags = document.createElement('div');
                 tags.style.marginTop = '6px';

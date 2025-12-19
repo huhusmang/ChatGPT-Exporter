@@ -1,0 +1,25 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package chrome extension
+        run: |
+          zip -r ChatGPT-Exporter.zip chrome-extension
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ChatGPT-Exporter.zip
+            Tampermonkey.js
+          generate_release_notes: true

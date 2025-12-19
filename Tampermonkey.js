@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         ChatGPT Universal Exporter (Markdown Support)
-// @version      1.0.0
+// @version      1.1.0
 // @description  User-centric ZIP exporter with multi-ID support. Supports JSON & Markdown formats. Based on ChatGPT Universal Exporter.
 // @author       huhu
 // @match        https://chatgpt.com/*
@@ -16,10 +16,11 @@
 // ==/UserScript==
 
 /* ============================================================
-    v1.0.0 变更 (基于原始脚本的Markdown支持增强版)
+    v1.1.0 变更 (对话选择与体验优化)
     ------------------------------------------------------------
-    • 增加了 Markdown 格式导出支持
-    • 保持了原有的 JSON 导出功能
+    • 新增「选择对话导出」与对话筛选/搜索
+    • 团队空间流程优化，检测到单一 Workspace 直接进入目标动作
+    • 大列表使用「加载更多」提升性能
     ========================================================== */
 
 (function () {
@@ -94,6 +95,11 @@
     const sleep = ms => new Promise(r => setTimeout(r, ms));
     const jitter = () => BASE_DELAY + Math.random() * JITTER;
     const sanitizeFilename = (name) => name.replace(/[\/\\?%*:|"<>]/g, '-').trim();
+    const formatTimestamp = (seconds) => {
+        if (!seconds) return '';
+        const date = new Date(seconds * 1000);
+        return Number.isNaN(date.getTime()) ? '' : date.toLocaleString();
+    };
 
     /**
      * [新增] 从Cookie中获取 oai-device-id
@@ -225,7 +231,8 @@
         return btn;
     }
 
-    async function startExportProcess(mode, workspaceId) {
+    async function exportConversations(options = {}) {
+        const { mode = 'personal', workspaceId = null, conversationEntries = null } = options;
         const btn = getExportButton();
         btn.disabled = true;
 
@@ -237,39 +244,58 @@
 
         try {
             const zip = new JSZip();
-            btn.textContent = '📂 获取项目外对话…';
-            const orphanIds = await collectIds(btn, workspaceId, null);
-            for (let i = 0; i < orphanIds.length; i++) {
-                btn.textContent = `📥 根目录 (${i + 1}/${orphanIds.length})`;
-                const convData = await getConversation(orphanIds[i], workspaceId);
-                zip.file(generateUniqueFilename(convData), JSON.stringify(convData, null, 2));
-                zip.file(generateMarkdownFilename(convData), convertConversationToMarkdown(convData));
-                await sleep(jitter());
-            }
-
-            btn.textContent = '🔍 获取项目列表…';
-            const projects = await getProjects(workspaceId);
-            for (const project of projects) {
-                const projectFolder = zip.folder(sanitizeFilename(project.title));
-                btn.textContent = `📂 项目: ${project.title}`;
-                const projectConvIds = await collectIds(btn, workspaceId, project.id);
-                if (projectConvIds.length === 0) continue;
-
-                for (let i = 0; i < projectConvIds.length; i++) {
-                    btn.textContent = `📥 ${project.title.substring(0,10)}... (${i + 1}/${projectConvIds.length})`;
-                    const convData = await getConversation(projectConvIds[i], workspaceId);
-                    projectFolder.file(generateUniqueFilename(convData), JSON.stringify(convData, null, 2));
-                    projectFolder.file(generateMarkdownFilename(convData), convertConversationToMarkdown(convData));
+            if (Array.isArray(conversationEntries) && conversationEntries.length > 0) {
+                for (let i = 0; i < conversationEntries.length; i++) {
+                    const entry = conversationEntries[i];
+                    const label = entry?.title ? entry.title.slice(0, 12) : '对话';
+                    btn.textContent = `📥 ${label} (${i + 1}/${conversationEntries.length})`;
+                    const convData = await getConversation(entry.id, workspaceId);
+                    const target = entry?.projectTitle
+                        ? zip.folder(sanitizeFilename(entry.projectTitle))
+                        : zip;
+                    target.file(generateUniqueFilename(convData), JSON.stringify(convData, null, 2));
+                    target.file(generateMarkdownFilename(convData), convertConversationToMarkdown(convData));
                     await sleep(jitter());
+                }
+            } else {
+                btn.textContent = '📂 获取项目外对话…';
+                const orphanIds = await collectIds(btn, workspaceId, null);
+                for (let i = 0; i < orphanIds.length; i++) {
+                    btn.textContent = `📥 根目录 (${i + 1}/${orphanIds.length})`;
+                    const convData = await getConversation(orphanIds[i], workspaceId);
+                    zip.file(generateUniqueFilename(convData), JSON.stringify(convData, null, 2));
+                    zip.file(generateMarkdownFilename(convData), convertConversationToMarkdown(convData));
+                    await sleep(jitter());
+                }
+
+                btn.textContent = '🔍 获取项目列表…';
+                const projects = await getProjects(workspaceId);
+                for (const project of projects) {
+                    const projectFolder = zip.folder(sanitizeFilename(project.title));
+                    btn.textContent = `📂 项目: ${project.title}`;
+                    const projectConvIds = await collectIds(btn, workspaceId, project.id);
+                    if (projectConvIds.length === 0) continue;
+
+                    for (let i = 0; i < projectConvIds.length; i++) {
+                        btn.textContent = `📥 ${project.title.substring(0,10)}... (${i + 1}/${projectConvIds.length})`;
+                        const convData = await getConversation(projectConvIds[i], workspaceId);
+                        projectFolder.file(generateUniqueFilename(convData), JSON.stringify(convData, null, 2));
+                        projectFolder.file(generateMarkdownFilename(convData), convertConversationToMarkdown(convData));
+                        await sleep(jitter());
+                    }
                 }
             }
 
             btn.textContent = '📦 生成 ZIP 文件…';
             const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
             const date = new Date().toISOString().slice(0, 10);
-            const filename = mode === 'team'
-                ? `chatgpt_team_backup_${workspaceId}_${date}.zip`
-                : `chatgpt_personal_backup_${date}.zip`;
+            const filename = (Array.isArray(conversationEntries) && conversationEntries.length > 0)
+                ? (mode === 'team'
+                    ? `chatgpt_team_selected_${workspaceId}_${date}.zip`
+                    : `chatgpt_personal_selected_${date}.zip`)
+                : (mode === 'team'
+                    ? `chatgpt_team_backup_${workspaceId}_${date}.zip`
+                    : `chatgpt_personal_backup_${date}.zip`);
             downloadFile(blob, filename);
             alert(`✅ 导出完成！`);
             btn.textContent = '✅ 完成';
@@ -284,6 +310,14 @@
                 btn.textContent = 'Export Conversations';
             }, 3000);
         }
+    }
+
+    async function startExportProcess(mode, workspaceId) {
+        await exportConversations({ mode, workspaceId });
+    }
+
+    async function startSelectiveExportProcess(mode, workspaceId, conversationEntries) {
+        await exportConversations({ mode, workspaceId, conversationEntries });
     }
 
     function startScheduledExport(options = {}) {
@@ -378,6 +412,89 @@
         return Array.from(all);
     }
 
+    async function listConversations(workspaceId) {
+        if (!await ensureAccessToken()) {
+            throw new Error('无法获取 Access Token，请刷新页面或打开任意一个对话后再试。');
+        }
+
+        const deviceId = getOaiDeviceId();
+        if (!deviceId) {
+            throw new Error('无法获取 oai-device-id，请确保已登录并刷新页面。');
+        }
+
+        const headers = {
+            'Authorization': `Bearer ${accessToken}`,
+            'oai-device-id': deviceId
+        };
+        if (workspaceId) { headers['ChatGPT-Account-Id'] = workspaceId; }
+
+        const map = new Map();
+        const addEntry = (item, extra = {}) => {
+            if (!item?.id) return;
+            const update_time = item.update_time || item.create_time || 0;
+            const entry = {
+                id: item.id,
+                title: item.title || 'Untitled Conversation',
+                update_time,
+                is_archived: item.is_archived ?? extra.is_archived ?? false,
+                projectId: extra.projectId || null,
+                projectTitle: extra.projectTitle || null
+            };
+            const existing = map.get(entry.id);
+            if (!existing) {
+                map.set(entry.id, entry);
+                return;
+            }
+            if (!existing.projectTitle && entry.projectTitle) {
+                existing.projectTitle = entry.projectTitle;
+                existing.projectId = entry.projectId;
+            }
+            existing.is_archived = existing.is_archived || entry.is_archived;
+            if ((entry.update_time || 0) > (existing.update_time || 0)) {
+                existing.update_time = entry.update_time;
+            }
+            if (existing.title === 'Untitled Conversation' && entry.title) {
+                existing.title = entry.title;
+            }
+        };
+
+        for (const is_archived of [false, true]) {
+            let offset = 0;
+            let has_more = true;
+            do {
+                const r = await fetch(`/backend-api/conversations?offset=${offset}&limit=${PAGE_LIMIT}&order=updated${is_archived ? '&is_archived=true' : ''}`, { headers });
+                if (!r.ok) throw new Error(`列举对话列表失败 (${r.status})`);
+                const j = await r.json();
+                if (j.items && j.items.length > 0) {
+                    j.items.forEach(it => addEntry(it, { is_archived }));
+                    has_more = j.items.length === PAGE_LIMIT;
+                    offset += j.items.length;
+                } else {
+                    has_more = false;
+                }
+                await sleep(jitter());
+            } while (has_more);
+        }
+
+        if (workspaceId) {
+            const projects = await getProjects(workspaceId);
+            for (const project of projects) {
+                let cursor = '0';
+                do {
+                    const r = await fetch(`/backend-api/gizmos/${project.id}/conversations?cursor=${cursor}`, { headers });
+                    if (!r.ok) throw new Error(`列举项目对话列表失败 (${r.status})`);
+                    const j = await r.json();
+                    j.items?.forEach(it => addEntry(it, { projectId: project.id, projectTitle: project.title }));
+                    cursor = j.cursor;
+                    await sleep(jitter());
+                } while (cursor);
+            }
+        }
+
+        return Array.from(map.values())
+            .sort((a, b) => (b.update_time || 0) - (a.update_time || 0));
+    }
+
     async function getConversation(id, workspaceId) {
         const deviceId = getOaiDeviceId();
         if (!deviceId) {
@@ -438,6 +555,269 @@
         return Array.from(foundIds);
     }
 
+    function showConversationPicker(options = {}) {
+        const { mode = 'personal', workspaceId = null } = options;
+        const existing = document.getElementById('export-dialog-overlay');
+        if (existing) existing.remove();
+
+        const overlay = document.createElement('div');
+        overlay.id = 'export-dialog-overlay';
+        Object.assign(overlay.style, {
+            position: 'fixed', top: '0', left: '0', width: '100%', height: '100%',
+            backgroundColor: 'rgba(0, 0, 0, 0.5)', zIndex: '99998',
+            display: 'flex', alignItems: 'center', justifyContent: 'center'
+        });
+
+        const dialog = document.createElement('div');
+        dialog.id = 'export-dialog';
+        Object.assign(dialog.style, {
+            background: '#fff', padding: '24px', borderRadius: '12px',
+            boxShadow: '0 5px 15px rgba(0,0,0,.3)', width: '720px',
+            fontFamily: 'sans-serif', color: '#333', boxSizing: 'border-box'
+        });
+
+        const closeDialog = () => document.body.removeChild(overlay);
+        const state = {
+            list: [],
+            filtered: [],
+            selected: new Set(),
+            query: '',
+            scope: 'all',
+            archived: 'all',
+            loading: true,
+            pageSize: 100,
+            visibleCount: 100
+        };
+
+        const renderBase = () => {
+            const modeLabel = mode === 'team' ? '团队空间' : '个人空间';
+            const workspaceLabel = workspaceId ? `（${workspaceId}）` : '';
+            dialog.innerHTML = `
+                <h2 style="margin-top:0; margin-bottom: 12px; font-size: 18px;">选择要导出的对话</h2>
+                <div style="margin-bottom: 12px; color: #666; font-size: 12px;">空间：${modeLabel}${workspaceLabel}</div>
+                <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+                    <input id="conv-search" type="text" placeholder="搜索标题/项目名/ID"
+                        style="flex: 1; padding: 8px; border-radius: 6px; border: 1px solid #ccc; box-sizing: border-box;">
+                    <select id="filter-scope" style="padding: 8px; border-radius: 6px; border: 1px solid #ccc;">
+                        <option value="all">全部范围</option>
+                        <option value="project">仅项目</option>
+                        <option value="root">仅项目外</option>
+                    </select>
+                    <select id="filter-archived" style="padding: 8px; border-radius: 6px; border: 1px solid #ccc;">
+                        <option value="all">全部状态</option>
+                        <option value="active">仅未归档</option>
+                        <option value="archived">仅已归档</option>
+                    </select>
+                </div>
+                <div id="conv-status" style="margin-bottom: 8px; font-size: 12px; color: #666;">正在加载列表...</div>
+                <div id="conv-list" style="max-height: 360px; overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px; background: #fff;"></div>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 16px;">
+                    <div style="display: flex; gap: 8px;">
+                        <button id="select-all-btn" style="padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer;">全选</button>
+                        <button id="clear-all-btn" style="padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer;">清空</button>
+                    </div>
+                    <div style="display: flex; gap: 8px;">
+                        <button id="back-btn" style="padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer;">返回</button>
+                        <button id="export-selected-btn" style="padding: 8px 12px; border: none; border-radius: 6px; background: #10a37f; color: #fff; cursor: pointer; font-weight: bold;" disabled>导出选中 (0)</button>
+                    </div>
+                </div>
+            `;
+
+            const searchInput = dialog.querySelector('#conv-search');
+            const scopeSelect = dialog.querySelector('#filter-scope');
+            const archivedSelect = dialog.querySelector('#filter-archived');
+            const selectAllBtn = dialog.querySelector('#select-all-btn');
+            const clearAllBtn = dialog.querySelector('#clear-all-btn');
+            const backBtn = dialog.querySelector('#back-btn');
+            const exportBtn = dialog.querySelector('#export-selected-btn');
+
+            searchInput.oninput = (e) => {
+                state.query = e.target.value || '';
+                applyFilters();
+                renderList();
+            };
+            scopeSelect.onchange = (e) => {
+                state.scope = e.target.value;
+                applyFilters();
+                renderList();
+            };
+            archivedSelect.onchange = (e) => {
+                state.archived = e.target.value;
+                applyFilters();
+                renderList();
+            };
+            selectAllBtn.onclick = () => {
+                state.filtered.forEach(item => state.selected.add(item.id));
+                renderList();
+            };
+            clearAllBtn.onclick = () => {
+                state.selected.clear();
+                renderList();
+            };
+            backBtn.onclick = () => {
+                closeDialog();
+                showExportDialog();
+            };
+            exportBtn.onclick = async () => {
+                if (state.selected.size === 0) return;
+                const selectedList = state.list.filter(item => state.selected.has(item.id));
+                closeDialog();
+                await startSelectiveExportProcess(mode, workspaceId, selectedList);
+            };
+        };
+
+        const applyFilters = () => {
+            const query = state.query.trim().toLowerCase();
+            state.filtered = state.list.filter(item => {
+                const text = `${item.title || ''} ${item.projectTitle || ''} ${item.id || ''}`.toLowerCase();
+                if (query && !text.includes(query)) return false;
+                if (state.scope === 'project' && !item.projectTitle) return false;
+                if (state.scope === 'root' && item.projectTitle) return false;
+                if (state.archived === 'active' && item.is_archived) return false;
+                if (state.archived === 'archived' && !item.is_archived) return false;
+                return true;
+            });
+            state.visibleCount = state.pageSize;
+        };
+
+        const renderList = () => {
+            const statusEl = dialog.querySelector('#conv-status');
+            const listEl = dialog.querySelector('#conv-list');
+            const exportBtn = dialog.querySelector('#export-selected-btn');
+            const selectAllBtn = dialog.querySelector('#select-all-btn');
+            const clearAllBtn = dialog.querySelector('#clear-all-btn');
+            const controlsDisabled = state.loading;
+
+            if (selectAllBtn) selectAllBtn.disabled = controlsDisabled;
+            if (clearAllBtn) clearAllBtn.disabled = controlsDisabled;
+            if (exportBtn) exportBtn.disabled = controlsDisabled || state.selected.size === 0;
+
+            listEl.innerHTML = '';
+            if (state.loading) {
+                statusEl.textContent = '正在加载列表...';
+                return;
+            }
+
+            const visibleCount = Math.min(state.visibleCount, state.filtered.length);
+            statusEl.textContent = `共 ${state.list.length} 条，当前筛选 ${state.filtered.length} 条，显示 ${visibleCount} 条，已选 ${state.selected.size} 条`;
+            exportBtn.textContent = `导出选中 (${state.selected.size})`;
+
+            if (state.filtered.length === 0) {
+                const empty = document.createElement('div');
+                empty.textContent = '没有匹配的对话。';
+                empty.style.color = '#999';
+                empty.style.padding = '8px 4px';
+                listEl.appendChild(empty);
+                return;
+            }
+
+            const visibleItems = state.filtered.slice(0, state.visibleCount);
+            visibleItems.forEach(item => {
+                const label = document.createElement('label');
+                Object.assign(label.style, {
+                    display: 'flex', gap: '8px', padding: '8px',
+                    border: '1px solid #e5e7eb', borderRadius: '6px',
+                    marginBottom: '8px', cursor: 'pointer', alignItems: 'flex-start'
+                });
+
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.checked = state.selected.has(item.id);
+                checkbox.onchange = (e) => {
+                    if (e.target.checked) {
+                        state.selected.add(item.id);
+                    } else {
+                        state.selected.delete(item.id);
+                    }
+                    renderList();
+                };
+
+                const content = document.createElement('div');
+                content.style.flex = '1';
+
+                const title = document.createElement('div');
+                title.textContent = item.title || 'Untitled Conversation';
+                title.style.fontWeight = 'bold';
+                title.style.fontSize = '14px';
+
+                const meta = document.createElement('div');
+                meta.style.fontSize = '12px';
+                meta.style.color = '#666';
+                const timeLabel = formatTimestamp(item.update_time) || '未知';
+                meta.textContent = `更新: ${timeLabel}`;
+
+                const tags = document.createElement('div');
+                tags.style.marginTop = '6px';
+                tags.style.display = 'flex';
+                tags.style.gap = '6px';
+                tags.style.flexWrap = 'wrap';
+
+                if (item.projectTitle) {
+                    const projectTag = document.createElement('span');
+                    projectTag.textContent = `项目: ${item.projectTitle}`;
+                    Object.assign(projectTag.style, {
+                        background: '#eef2ff', color: '#4338ca',
+                        padding: '2px 6px', borderRadius: '999px', fontSize: '11px'
+                    });
+                    tags.appendChild(projectTag);
+                }
+
+                if (item.is_archived) {
+                    const archivedTag = document.createElement('span');
+                    archivedTag.textContent = '已归档';
+                    Object.assign(archivedTag.style, {
+                        background: '#fef3c7', color: '#92400e',
+                        padding: '2px 6px', borderRadius: '999px', fontSize: '11px'
+                    });
+                    tags.appendChild(archivedTag);
+                }
+
+                content.appendChild(title);
+                content.appendChild(meta);
+                if (tags.childNodes.length > 0) content.appendChild(tags);
+
+                label.appendChild(checkbox);
+                label.appendChild(content);
+                listEl.appendChild(label);
+            });
+
+            if (state.filtered.length > state.visibleCount) {
+                const loadMore = document.createElement('button');
+                loadMore.textContent = `加载更多（剩余 ${state.filtered.length - state.visibleCount} 条）`;
+                Object.assign(loadMore.style, {
+                    width: '100%', padding: '8px 12px', border: '1px solid #ccc',
+                    borderRadius: '6px', background: '#fff', cursor: 'pointer'
+                });
+                loadMore.onclick = () => {
+                    state.visibleCount = Math.min(state.visibleCount + state.pageSize, state.filtered.length);
+                    renderList();
+                };
+                listEl.appendChild(loadMore);
+            }
+        };
+
+        renderBase();
+        overlay.appendChild(dialog);
+        document.body.appendChild(overlay);
+        overlay.onclick = (e) => { if (e.target === overlay) closeDialog(); };
+
+        listConversations(workspaceId)
+            .then(list => {
+                state.list = list;
+                state.loading = false;
+                applyFilters();
+                renderList();
+            })
+            .catch(err => {
+                const statusEl = dialog.querySelector('#conv-status');
+                state.loading = false;
+                state.list = [];
+                state.filtered = [];
+                statusEl.textContent = `加载失败: ${err.message}`;
+                renderList();
+            });
+    }
+
     /**
      * [重构] 多步骤、用户主导的导出对话框
      */
@@ -462,10 +842,12 @@
 
         const closeDialog = () => document.body.removeChild(overlay);
 
-        const renderStep = (step) => {
+        let pendingTeamAction = null;
+        const renderStep = (step, action = null) => {
+            pendingTeamAction = action;
             let html = '';
             switch (step) {
-                case 'team':
+                case 'team': {
                     const detectedIds = detectAllWorkspaceIds();
                     html = `<h2 style="margin-top:0; margin-bottom: 20px; font-size: 18px;">导出团队空间</h2>`;
 
@@ -494,24 +876,45 @@
                                    <input type="text" id="team-id-input" placeholder="粘贴您的 Workspace ID (ws-...)" style="width: 100%; padding: 8px; border-radius: 6px; border: 1px solid #ccc; box-sizing: border-box;">`;
                     }
 
+                    let actionButtons = '';
+                    if (pendingTeamAction === 'all') {
+                        actionButtons = `<button id="start-team-export-btn" style="padding: 10px 16px; border: none; border-radius: 8px; background: #10a37f; color: #fff; cursor: pointer; font-weight: bold;">导出全部 (ZIP)</button>`;
+                    } else if (pendingTeamAction === 'select') {
+                        actionButtons = `<button id="start-team-picker-btn" style="padding: 10px 16px; border: 1px solid #ccc; border-radius: 8px; background: #fff; cursor: pointer;">选择对话导出</button>`;
+                    } else {
+                        actionButtons = `<button id="start-team-export-btn" style="padding: 10px 16px; border: none; border-radius: 8px; background: #10a37f; color: #fff; cursor: pointer; font-weight: bold;">导出全部 (ZIP)</button>
+                                     <button id="start-team-picker-btn" style="padding: 10px 16px; border: 1px solid #ccc; border-radius: 8px; background: #fff; cursor: pointer;">选择对话导出</button>`;
+                    }
+
                     html += `<div style="display: flex; justify-content: space-between; align-items: center; margin-top: 24px;">
                                  <button id="back-btn" style="padding: 10px 16px; border: 1px solid #ccc; border-radius: 8px; background: #fff; cursor: pointer;">返回</button>
-                                 <button id="start-team-export-btn" style="padding: 10px 16px; border: none; border-radius: 8px; background: #10a37f; color: #fff; cursor: pointer; font-weight: bold;">开始导出 (ZIP)</button>
+                                 <div style="display: flex; gap: 8px;">
+                                     ${actionButtons}
+                                 </div>
                                </div>`;
                     break;
+                }
 
                 case 'initial':
                 default:
                     html = `<h2 style="margin-top:0; margin-bottom: 20px; font-size: 18px;">选择要导出的空间</h2>
                                 <div style="display: flex; flex-direction: column; gap: 16px;">
-                                    <button id="select-personal-btn" style="padding: 16px; text-align: left; border: 1px solid #ccc; border-radius: 8px; background: #f9fafb; cursor: pointer; width: 100%;">
+                                    <div style="padding: 16px; border: 1px solid #ccc; border-radius: 8px; background: #f9fafb;">
                                         <strong style="font-size: 16px;">个人空间</strong>
-                                        <p style="margin: 4px 0 0 0; color: #666;">导出您个人账户下的所有对话。</p>
-                                    </button>
-                                    <button id="select-team-btn" style="padding: 16px; text-align: left; border: 1px solid #ccc; border-radius: 8px; background: #f9fafb; cursor: pointer; width: 100%;">
+                                        <p style="margin: 4px 0 12px 0; color: #666;">导出您个人账户下的对话。</p>
+                                        <div style="display: flex; gap: 8px;">
+                                            <button id="select-personal-btn" style="padding: 8px 12px; border: none; border-radius: 6px; background: #10a37f; color: #fff; cursor: pointer; font-weight: bold;">导出全部</button>
+                                            <button id="select-personal-picker-btn" style="padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer;">选择对话导出</button>
+                                        </div>
+                                    </div>
+                                    <div style="padding: 16px; border: 1px solid #ccc; border-radius: 8px; background: #f9fafb;">
                                         <strong style="font-size: 16px;">团队空间</strong>
-                                        <p style="margin: 4px 0 0 0; color: #666;">导出团队空间下的对话，将自动检测ID。</p>
-                                    </button>
+                                        <p style="margin: 4px 0 12px 0; color: #666;">导出团队空间下的对话，将自动检测ID。</p>
+                                        <div style="display: flex; gap: 8px;">
+                                            <button id="select-team-btn" style="padding: 8px 12px; border: none; border-radius: 6px; background: #10a37f; color: #fff; cursor: pointer; font-weight: bold;">导出全部</button>
+                                            <button id="select-team-picker-btn" style="padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer;">选择对话导出</button>
+                                        </div>
+                                    </div>
                                 </div>
                                 <div style="display: flex; justify-content: flex-end; margin-top: 24px;">
                                     <button id="cancel-btn" style="padding: 10px 16px; border: 1px solid #ccc; border-radius: 8px; background: #fff; cursor: pointer;">取消</button>
@@ -528,11 +931,30 @@
                     closeDialog();
                     startExportProcess('personal', null);
                 };
-                document.getElementById('select-team-btn').onclick = () => renderStep('team');
+                document.getElementById('select-personal-picker-btn').onclick = () => {
+                    closeDialog();
+                    showConversationPicker({ mode: 'personal', workspaceId: null });
+                };
+                const startTeamFlow = (action) => {
+                    const detectedIds = detectAllWorkspaceIds();
+                    if (detectedIds.length === 1) {
+                        const workspaceId = detectedIds[0];
+                        closeDialog();
+                        if (action === 'all') {
+                            startExportProcess('team', workspaceId);
+                        } else {
+                            showConversationPicker({ mode: 'team', workspaceId });
+                        }
+                        return;
+                    }
+                    renderStep('team', action);
+                };
+                document.getElementById('select-team-btn').onclick = () => startTeamFlow('all');
+                document.getElementById('select-team-picker-btn').onclick = () => startTeamFlow('select');
                 document.getElementById('cancel-btn').onclick = closeDialog;
             } else if (step === 'team') {
                 document.getElementById('back-btn').onclick = () => renderStep('initial');
-                document.getElementById('start-team-export-btn').onclick = () => {
+                const resolveWorkspaceId = () => {
                     let workspaceId = '';
                     const radioChecked = document.querySelector('input[name="workspace_id"]:checked');
                     const codeEl = document.getElementById('workspace-id-code');
@@ -550,8 +972,21 @@
                         alert('请选择或输入一个有效的 Team Workspace ID！');
                         return;
                     }
+                    return workspaceId;
+                };
+                const exportAllBtn = document.getElementById('start-team-export-btn');
+                const pickerBtn = document.getElementById('start-team-picker-btn');
+                if (exportAllBtn) exportAllBtn.onclick = () => {
+                    const workspaceId = resolveWorkspaceId();
+                    if (!workspaceId) return;
                     closeDialog();
                     startExportProcess('team', workspaceId);
+                };
+                if (pickerBtn) pickerBtn.onclick = () => {
+                    const workspaceId = resolveWorkspaceId();
+                    if (!workspaceId) return;
+                    closeDialog();
+                    showConversationPicker({ mode: 'team', workspaceId });
                 };
             }
         };

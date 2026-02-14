@@ -750,7 +750,8 @@
             'Authorization': `Bearer ${accessToken}`,
             'oai-device-id': deviceId
         };
-        if (workspaceId) { headers['ChatGPT-Account-Id'] = workspaceId; }
+    const resolvedWorkspaceId = resolveWorkspaceId(workspaceId);
+    if (resolvedWorkspaceId) { headers['ChatGPT-Account-Id'] = resolvedWorkspaceId; }
         const r = await fetch(`/backend-api/conversation/${id}`, { headers });
         if (!r.ok) throw new Error(`获取对话详情失败 conv ${id} (${r.status})`);
         const j = await r.json();

@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         ChatGPT Universal Exporter (Markdown Support)
-// @version      1.3.1
+// @version      1.3.2
 // @description  User-centric ZIP exporter for personal/team/project spaces. Supports JSON & Markdown formats. Based on ChatGPT Universal Exporter.
 // @author       huhu
 // @match        https://chatgpt.com/*
@@ -16,11 +16,11 @@
 // ==/UserScript==
 
 /* ============================================================
-    v1.3.0 变更 (项目空间导出)
+    v1.3.2 变更 (项目空间分页修复)
     ------------------------------------------------------------
-    • 新增项目空间导出入口，按项目自动分组
-    • 项目空间对话列表请求补齐 Workspace ID
-    • 项目空间列表优先全量拉取，失败则回退侧边栏预览
+    • 项目空间列表显式使用 limit=50 拉取
+    • 支持根据 cursor 分页获取全部项目
+    • 复用分页逻辑，避免默认只显示 5 个项目
     ========================================================== */
 
 (function () {
@@ -31,6 +31,7 @@
     const JITTER = 400;
     const PAGE_LIMIT = 100;
     const PROJECT_SIDEBAR_PREVIEW = 5;
+    const PROJECT_SIDEBAR_LIMIT = 50;
     let accessToken = null;
     let capturedWorkspaceIds = new Set(); // 使用Set存储网络拦截到的ID，确保唯一性
 
@@ -497,30 +498,17 @@
     }
 
     // --- API 调用函数 ---
-    async function getProjects(workspaceId) {
-        if (!workspaceId) return [];
-        const deviceId = getOaiDeviceId();
-        if (!deviceId) {
-            throw new Error('无法获取 oai-device-id，请确保已登录并刷新页面。');
-        }
-        const headers = {
-            'Authorization': `Bearer ${accessToken}`,
-            'ChatGPT-Account-Id': workspaceId,
-            'oai-device-id': deviceId
+    function normalizeProjectSpaceItem(item) {
+        const rawGizmo = item?.gizmo?.gizmo || item?.gizmo || item;
+        const display = rawGizmo?.display || item?.gizmo?.display || item?.display;
+        const id = rawGizmo?.id || item?.gizmo?.id || item?.id;
+        const title = display?.name || rawGizmo?.name || 'Untitled Project';
+        if (!id) return null;
+        return {
+            id,
+            title,
+            conversations: item?.conversations?.items || []
         };
-        const r = await fetch(`/backend-api/gizmos/snorlax/sidebar`, { headers });
-        if (!r.ok) {
-            console.warn(`获取项目(Gizmo)列表失败 (${r.status})`);
-            return [];
-        }
-        const data = await r.json();
-        const projects = [];
-        data.items?.forEach(item => {
-            if (item?.gizmo?.id && item?.gizmo?.display?.name) {
-                projects.push({ id: item.gizmo.id, title: item.gizmo.display.name });
-            }
-        });
-        return projects;
     }
 
     function resolveWorkspaceId(workspaceId) {
@@ -543,36 +531,51 @@
         const resolvedWorkspaceId = resolveWorkspaceId(workspaceId);
         if (resolvedWorkspaceId) { headers['ChatGPT-Account-Id'] = resolvedWorkspaceId; }
 
-        const query = new URLSearchParams();
-        if (options.conversationsPerGizmo !== undefined) {
-            query.set('conversations_per_gizmo', String(options.conversationsPerGizmo));
-        }
-        if (options.ownedOnly !== undefined) {
-            query.set('owned_only', options.ownedOnly ? 'true' : 'false');
-        }
-        const url = query.toString()
-            ? `/backend-api/gizmos/snorlax/sidebar?${query.toString()}`
-            : '/backend-api/gizmos/snorlax/sidebar';
+        const projects = new Map();
+        let cursor = null;
 
-        const r = await fetch(url, { headers });
-        if (!r.ok) {
-            throw new Error(`获取项目空间列表失败 (${r.status})`);
-        }
-        const data = await r.json();
-        const projects = [];
-        data.items?.forEach(item => {
-            const rawGizmo = item?.gizmo?.gizmo || item?.gizmo || item;
-            const display = rawGizmo?.display || item?.gizmo?.display || item?.display;
-            const id = rawGizmo?.id || item?.gizmo?.id || item?.id;
-            const title = display?.name || rawGizmo?.name || 'Untitled Project';
-            if (!id) return;
-            projects.push({
-                id,
-                title,
-                conversations: item?.conversations?.items || []
+        do {
+            const query = new URLSearchParams();
+            query.set('limit', String(PROJECT_SIDEBAR_LIMIT));
+            if (options.conversationsPerGizmo !== undefined) {
+                query.set('conversations_per_gizmo', String(options.conversationsPerGizmo));
+            }
+            if (options.ownedOnly !== undefined) {
+                query.set('owned_only', options.ownedOnly ? 'true' : 'false');
+            }
+            if (cursor) {
+                query.set('cursor', cursor);
+            }
+
+            const r = await fetch(`/backend-api/gizmos/snorlax/sidebar?${query.toString()}`, { headers });
+            if (!r.ok) {
+                throw new Error(`获取项目空间列表失败 (${r.status})`);
+            }
+            const data = await r.json();
+            data.items?.forEach(item => {
+                const project = normalizeProjectSpaceItem(item);
+                if (project) {
+                    projects.set(project.id, project);
+                }
             });
-        });
-        return projects;
+            cursor = data.cursor || null;
+            if (cursor) {
+                await sleep(jitter());
+            }
+        } while (cursor);
+
+        return Array.from(projects.values());
+    }
+
+    async function getProjects(workspaceId) {
+        if (!workspaceId) return [];
+        try {
+            const projects = await getProjectSpaces(workspaceId);
+            return projects.map(({ id, title }) => ({ id, title }));
+        } catch (err) {
+            console.warn(`获取项目(Gizmo)列表失败 (${err?.message || err})`);
+            return [];
+        }
     }
 
     async function collectIds(btn, workspaceId, gizmoId) {

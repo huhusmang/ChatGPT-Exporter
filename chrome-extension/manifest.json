@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "ChatGPT Universal Exporter",
   "description": "Auto-export ChatGPT conversations (personal/team/project) as JSON+Markdown with scheduled reminders.",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "permissions": [
     "storage",
     "alarms",

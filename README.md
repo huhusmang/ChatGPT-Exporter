@@ -79,6 +79,26 @@ Chrome 扩展提供更完整的功能，包括定时自动提醒、弹窗界面�
 
 ## 核心功能说明
 
+### 原文件增量备份（v1.5.0）
+
+批量导出默认使用原文件目录模式，适合大量对话：首次导出时选择一个本地目录，之后会复用已授权目录，不会为每条文件重复弹出选择框。每条对话会独立保存为 JSON、Markdown 和可选附件；单条请求失败会记录到 `failed-conversations.json` 并继续处理。
+
+任务目录中包含 `manifest.json`，页面刷新或浏览器重启后再次导出会继续未完成的任务。Chrome 可能在一段时间后撤销目录写权限，此时需要重新授权。若浏览器不支持 File System Access API，可在导出对话框中切换到 ZIP 模式。
+
+原文件目录示例：
+
+```text
+backup-2026-07-11-120000/
+├── manifest.json
+├── export-report.json
+├── failed-conversations.json
+└── conversations/
+    └── 对话标题__conversation-id/
+        ├── conversation.json
+        ├── conversation.md
+        └── attachments/
+```
+
 ### Token 获取
 脚本会自动捕获 ChatGPT 的 Access Token 和 Device ID，用于 API 调用认证。
 

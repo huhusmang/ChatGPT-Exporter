@@ -1,7 +1,7 @@
 (function () {
     const EXPORT_READY_EVENT = 'CHATGPT_EXPORTER_READY';
     const COMMAND_TYPE = 'CHATGPT_EXPORTER_COMMAND';
-    const EXPECTED_VERSION = '1.4.0';
+    const EXPECTED_VERSION = '1.5.0';
     let exporterReady = false;
     const pendingCommands = [];
 
@@ -47,4 +47,3 @@
         return false;
     });
 })();
-

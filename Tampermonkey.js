@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         ChatGPT Universal Exporter (Markdown Support)
-// @version      1.4.0
+// @version      1.5.0
 // @description  Export ChatGPT conversations with visible uploads and generated files as JSON+Markdown ZIP backups.
 // @author       huhu
 // @match        https://chatgpt.com/*
@@ -32,6 +32,13 @@
     const PAGE_LIMIT = 100;
     const PROJECT_SIDEBAR_PREVIEW = 5;
     const PROJECT_SIDEBAR_LIMIT = 50;
+    const EXPORTER_VERSION = '1.5.0';
+    const DIRECTORY_DB_NAME = 'chatgpt-exporter';
+    const DIRECTORY_DB_STORE = 'handles';
+    const DEFAULT_EXPORT_MODE = 'directory';
+    const DEFAULT_MAX_ATTEMPTS = 3;
+    const CONVERSATION_CONCURRENCY = 2;
+    let activeDirectoryHandle = null;
     let accessToken = null;
     let capturedWorkspaceIds = new Set(); // 使用Set存储网络拦截到的ID，确保唯一性
 
@@ -128,6 +135,143 @@
         return Number.isNaN(epochMs) ? null : Math.floor(epochMs / 1000);
     };
 
+    function openDirectoryDb() {
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open(DIRECTORY_DB_NAME, 1);
+            request.onupgradeneeded = () => request.result.createObjectStore(DIRECTORY_DB_STORE);
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error || new Error('无法打开本地目录设置'));
+        });
+    }
+
+    async function getStoredDirectoryHandle() {
+        const db = await openDirectoryDb();
+        return new Promise((resolve, reject) => {
+            const request = db.transaction(DIRECTORY_DB_STORE).objectStore(DIRECTORY_DB_STORE).get('backup-directory');
+            request.onsuccess = () => { db.close(); resolve(request.result || null); };
+            request.onerror = () => { db.close(); reject(request.error); };
+        });
+    }
+
+    async function storeDirectoryHandle(handle) {
+        const db = await openDirectoryDb();
+        return new Promise((resolve, reject) => {
+            const request = db.transaction(DIRECTORY_DB_STORE, 'readwrite').objectStore(DIRECTORY_DB_STORE).put(handle, 'backup-directory');
+            request.onsuccess = () => { db.close(); resolve(handle); };
+            request.onerror = () => { db.close(); reject(request.error); };
+        });
+    }
+
+    async function getDirectoryState(key) {
+        const db = await openDirectoryDb();
+        return new Promise((resolve, reject) => {
+            const request = db.transaction(DIRECTORY_DB_STORE).objectStore(DIRECTORY_DB_STORE).get(key);
+            request.onsuccess = () => { db.close(); resolve(request.result ?? null); };
+            request.onerror = () => { db.close(); reject(request.error); };
+        });
+    }
+
+    async function setDirectoryState(key, value) {
+        const db = await openDirectoryDb();
+        return new Promise((resolve, reject) => {
+            const request = db.transaction(DIRECTORY_DB_STORE, 'readwrite').objectStore(DIRECTORY_DB_STORE).put(value, key);
+            request.onsuccess = () => { db.close(); resolve(value); };
+            request.onerror = () => { db.close(); reject(request.error); };
+        });
+    }
+
+    async function ensureDirectoryHandle() {
+        if (!('showDirectoryPicker' in window)) {
+            throw new Error('当前浏览器不支持原文件目录模式，请改用 ZIP 导出。');
+        }
+        if (activeDirectoryHandle) {
+            try {
+                const permission = await activeDirectoryHandle.requestPermission({ mode: 'readwrite' });
+                if (permission === 'granted') return activeDirectoryHandle;
+            } catch (_) {}
+        }
+        const handle = await window.showDirectoryPicker({ id: 'chatgpt-exporter-backup', mode: 'readwrite' });
+        activeDirectoryHandle = handle;
+        await storeDirectoryHandle(handle);
+        return activeDirectoryHandle;
+    }
+
+    async function getChildDirectory(root, path, create = true) {
+        let current = root;
+        for (const segment of path.filter(Boolean)) current = await current.getDirectoryHandle(segment, { create });
+        return current;
+    }
+
+    async function writeDirectoryFile(root, path, data) {
+        const segments = path.split('/');
+        const fileName = segments.pop();
+        const directory = await getChildDirectory(root, segments);
+        const fileHandle = await directory.getFileHandle(fileName, { create: true });
+        const writable = await fileHandle.createWritable();
+        try {
+            await writable.write(data);
+            await writable.close();
+        } catch (error) {
+            try { await writable.abort(); } catch (_) {}
+            throw error;
+        }
+    }
+
+    function exportDirectoryName(convData) {
+        const id = convData?.conversation_id || `unknown-${Date.now().toString(36)}`;
+        const title = sanitizeFilename(convData?.title || 'Untitled Conversation').slice(0, 80) || 'Untitled Conversation';
+        return `${title}__${id}`;
+    }
+
+    async function addConversationToDirectory(root, convData, workspaceId, report) {
+        const folder = `conversations/${exportDirectoryName(convData)}`;
+        const attachmentResult = { detected: 0, files: [], failures: [], sandboxPaths: new Map() };
+        await writeDirectoryFile(root, `${folder}/conversation.json`, JSON.stringify(convData, null, 2));
+        if (report?.includeAttachments) {
+            const references = collectVisibleAttachments(convData);
+            attachmentResult.detected = references.length;
+            const usedNames = new Set();
+            for (const reference of references) {
+                try {
+                    const downloaded = await fetchWithRetry(() => fetchAttachmentBinary(reference, convData, workspaceId));
+                    const filename = uniqueAttachmentName(downloaded.filename, usedNames);
+                    await writeDirectoryFile(root, `${folder}/attachments/${filename}`, downloaded.data);
+                    const relativePath = `${folder}/attachments/${filename}`;
+                    attachmentResult.files.push({ name: filename, path: relativePath, kind: reference.kind, isImage: reference.isImage, messageId: reference.messageId, ownerRole: reference.ownerRole });
+                    if (reference.kind === 'sandbox') attachmentResult.sandboxPaths.set(`${reference.messageId}|${reference.sandboxPath}`, relativePath);
+                } catch (error) {
+                    attachmentResult.failures.push({ kind: reference.kind, file_id: reference.fileId || null, sandbox_path: reference.sandboxPath || null, message_id: reference.messageId || null, name: reference.name, error: error?.message || String(error) });
+                }
+            }
+        }
+        await writeDirectoryFile(root, `${folder}/conversation.md`, convertConversationToMarkdown(convData, attachmentResult));
+        if (report) {
+            report.detected += attachmentResult.detected;
+            report.downloaded += attachmentResult.files.length;
+            report.failed += attachmentResult.failures.length;
+            report.conversations.push({ conversation_id: convData?.conversation_id || null, title: convData?.title || 'Untitled Conversation', detected: attachmentResult.detected, downloaded: attachmentResult.files, failures: attachmentResult.failures });
+        }
+        return { folder, attachmentResult };
+    }
+
+    async function fetchWithRetry(task, options = {}) {
+        const maxAttempts = options.maxAttempts || DEFAULT_MAX_ATTEMPTS;
+        let lastError;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try { return await task(); } catch (error) {
+                lastError = error;
+                const status = Number(error?.status || error?.response?.status || 0);
+                const retryable = !status || [408, 429, 500, 502, 503, 504].includes(status);
+                if (!retryable || attempt === maxAttempts) break;
+                const retryAfter = Number(error?.retryAfter || 0);
+                await sleep(retryAfter > 0 ? retryAfter * 1000 : Math.min(8000, 1000 * 2 ** (attempt - 1)) + Math.random() * 300);
+            }
+        }
+        throw lastError;
+    }
+
+    getStoredDirectoryHandle().then(handle => { activeDirectoryHandle = handle; }).catch(() => {});
+
     /**
      * [新增] 从Cookie中获取 oai-device-id
      * @returns {string|null} - 返回设备ID或null
@@ -155,7 +299,7 @@
             : `${jsonName}.md`;
     }
 
-    const ATTACHMENT_EXPORT_VERSION = '1.4.0';
+    const ATTACHMENT_EXPORT_VERSION = EXPORTER_VERSION;
     const EXPORT_BUTTON_LABEL = `Export Conversations v${ATTACHMENT_EXPORT_VERSION}`;
     const MIME_EXTENSIONS = {
         'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp',
@@ -613,7 +757,7 @@
         });
     }
 
-    async function exportConversations(options = {}) {
+    async function exportConversationsZip(options = {}) {
         const {
             mode = 'personal',
             workspaceId = null,
@@ -719,11 +863,106 @@
         }
     }
 
-    async function startExportProcess(mode, workspaceId, includeAttachments = false) {
-        await exportConversations({ mode, workspaceId, includeAttachments });
+    async function exportConversationsDirectory(options = {}) {
+        const { mode = 'personal', workspaceId = null, conversationEntries = null, exportType = null, includeAttachments = false } = options;
+        const btn = getExportButton();
+        btn.disabled = true;
+        let root;
+        try {
+            root = await ensureDirectoryHandle();
+            if (!await ensureAccessToken()) return;
+            const sourceEntries = [];
+            if (Array.isArray(conversationEntries) && conversationEntries.length > 0) {
+                sourceEntries.push(...conversationEntries);
+            } else {
+                btn.textContent = '📂 获取项目外对话…';
+                const orphanIds = await collectIds(btn, workspaceId, null);
+                sourceEntries.push(...orphanIds.map(id => ({ id, title: 'Untitled Conversation' })));
+                btn.textContent = '🔍 获取项目列表…';
+                const projects = await getProjects(workspaceId);
+                for (const project of projects) {
+                    const ids = await collectIds(btn, workspaceId, project.id);
+                    sourceEntries.push(...ids.map(id => ({ id, title: 'Untitled Conversation', projectTitle: project.title })));
+                }
+            }
+            let taskId = await getDirectoryState('active-task-id');
+            let manifest = null;
+            if (taskId) {
+                try {
+                    const existingRoot = await root.getDirectoryHandle(taskId, { create: false });
+                    const file = await (await existingRoot.getFileHandle('manifest.json')).getFile();
+                    const candidate = JSON.parse(await file.text());
+                    if (candidate.status === 'running' || candidate.status === 'paused') manifest = candidate;
+                } catch (_) { taskId = null; }
+            }
+            if (!taskId || !manifest) {
+                taskId = `backup-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`;
+                manifest = { schema_version: 1, exporter_version: EXPORTER_VERSION, task_id: taskId, status: 'running', created_at: new Date().toISOString(), updated_at: new Date().toISOString(), mode, workspace_id: workspaceId, options: { include_attachments: includeAttachments, max_attempts: DEFAULT_MAX_ATTEMPTS }, totals: { discovered: sourceEntries.length, completed: 0, failed: 0 }, conversations: {} };
+                await setDirectoryState('active-task-id', taskId);
+            }
+            const taskRoot = await root.getDirectoryHandle(taskId, { create: true });
+            const completedIds = new Set(Object.entries(manifest.conversations || {}).filter(([, item]) => item.status === 'completed' || item.status === 'unchanged').map(([id]) => id));
+            const pendingEntries = sourceEntries.filter(entry => !completedIds.has(entry.id));
+            manifest.totals.discovered = sourceEntries.length;
+            const report = { exporter_version: EXPORTER_VERSION, task_id: taskId, generated_at: new Date().toISOString(), detected: 0, downloaded: 0, failed: 0, conversations: [] };
+            report.includeAttachments = includeAttachments;
+            const failed = [];
+            let manifestWriteQueue = Promise.resolve();
+            const persistManifest = () => {
+                manifestWriteQueue = manifestWriteQueue.then(async () => {
+                    manifest.updated_at = new Date().toISOString();
+                    await writeDirectoryFile(taskRoot, 'manifest.json', JSON.stringify(manifest, null, 2));
+                });
+                return manifestWriteQueue;
+            };
+            await persistManifest();
+            let nextIndex = 0;
+            const worker = async () => {
+                while (nextIndex < pendingEntries.length) {
+                    const index = nextIndex++;
+                    const entry = pendingEntries[index];
+                    btn.textContent = `📥 ${(entry.title || '对话').slice(0, 12)} (${Math.min(index + 1, pendingEntries.length)}/${pendingEntries.length})`;
+                    try {
+                        const convData = await fetchWithRetry(() => getConversation(entry.id, workspaceId));
+                        const result = await addConversationToDirectory(taskRoot, convData, workspaceId, report);
+                        manifest.conversations[entry.id] = { status: 'completed', source_update_time: entry.update_time || 0, directory: result.folder, completed_at: new Date().toISOString(), attachment_failures: result.attachmentResult.failures };
+                        manifest.totals.completed++;
+                    } catch (error) {
+                        const failure = { id: entry.id, title: entry.title || 'Untitled Conversation', project: entry.projectTitle || null, error: error?.message || String(error) };
+                        failed.push(failure);
+                        manifest.conversations[entry.id] = { status: 'failed', error: failure.error, failed_at: new Date().toISOString() };
+                        manifest.totals.failed++;
+                    }
+                    await persistManifest();
+                    await sleep(jitter());
+                }
+            };
+            await Promise.all(Array.from({ length: Math.min(CONVERSATION_CONCURRENCY, pendingEntries.length || 1) }, worker));
+            manifest.status = 'completed';
+            await persistManifest();
+            await writeDirectoryFile(taskRoot, 'export-report.json', JSON.stringify(report, null, 2));
+            await writeDirectoryFile(taskRoot, 'failed-conversations.json', JSON.stringify(failed, null, 2));
+            await setDirectoryState('active-task-id', null);
+            alert(`✅ 原文件导出完成！成功 ${manifest.totals.completed}，失败 ${manifest.totals.failed}。\n目录：${taskId}`);
+            btn.textContent = '✅ 完成';
+        } catch (error) {
+            console.error('原文件导出失败:', error);
+            alert(`原文件导出失败: ${error?.message || error}`);
+            btn.textContent = '⚠️ Error';
+        } finally {
+            setTimeout(() => { btn.disabled = false; btn.textContent = EXPORT_BUTTON_LABEL; }, 3000);
+        }
     }
 
-    async function startProjectSpaceExportProcess(workspaceId = null, includeAttachments = false) {
+    async function exportConversations(options = {}) {
+        return options.outputMode === 'zip' ? exportConversationsZip(options) : exportConversationsDirectory(options);
+    }
+
+    async function startExportProcess(mode, workspaceId, includeAttachments = false, outputMode = DEFAULT_EXPORT_MODE) {
+        await exportConversations({ mode, workspaceId, includeAttachments, outputMode });
+    }
+
+    async function startProjectSpaceExportProcess(workspaceId = null, includeAttachments = false, outputMode = DEFAULT_EXPORT_MODE) {
         try {
             const projectEntries = await listProjectSpaceConversations(workspaceId);
             if (projectEntries.length === 0) {
@@ -735,7 +974,8 @@
                 workspaceId,
                 conversationEntries: projectEntries,
                 exportType: 'full',
-                includeAttachments
+                includeAttachments,
+                outputMode
             });
         } catch (err) {
             console.error('导出项目空间失败:', err);
@@ -743,8 +983,8 @@
         }
     }
 
-    async function startSelectiveExportProcess(mode, workspaceId, conversationEntries, includeAttachments = false) {
-        await exportConversations({ mode, workspaceId, conversationEntries, includeAttachments });
+    async function startSelectiveExportProcess(mode, workspaceId, conversationEntries, includeAttachments = false, outputMode = DEFAULT_EXPORT_MODE) {
+        await exportConversations({ mode, workspaceId, conversationEntries, includeAttachments, outputMode });
     }
 
     function startScheduledExport(options = {}) {
@@ -1059,9 +1299,15 @@
         const r = await fetch(`/backend-api/conversation/${id}`, { headers });
         if (!r.ok) {
             if (r.status === 429) {
-                throw new Error(`获取对话详情失败 conv ${id}：官方接口限流 (429)。请降低导出频率、减少单次导出的对话数量，等待几分钟后再试。`);
+                const error = new Error(`获取对话详情失败 conv ${id}：官方接口限流 (429)。`);
+                error.status = 429;
+                const retryAfter = Number(r.headers.get('retry-after'));
+                if (Number.isFinite(retryAfter)) error.retryAfter = retryAfter;
+                throw error;
             }
-            throw new Error(`获取对话详情失败 conv ${id} (${r.status})`);
+            const error = new Error(`获取对话详情失败 conv ${id} (${r.status})`);
+            error.status = r.status;
+            throw error;
         }
         const j = await r.json();
         j.__fetched_at = new Date().toISOString();

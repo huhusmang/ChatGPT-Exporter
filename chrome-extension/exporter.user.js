@@ -438,16 +438,32 @@
 
         const messages = [];
         const mappingKeys = Object.keys(mapping);
+        if (mappingKeys.length === 0) return messages;
+
         const rootId = mapping['client-created-root']
             ? 'client-created-root'
             : mappingKeys.find(id => !mapping[id]?.parent) || mappingKeys[0];
         const visited = new Set();
 
-        const traverse = (nodeId) => {
-            if (!nodeId || visited.has(nodeId)) return;
+        // 使用显式栈进行 DFS，避免复杂/深层分支导致 JavaScript 调用栈溢出。
+        // children 逆序入栈，可以保持与原来的递归 node.children.forEach(traverse)
+        // 完全相同的深度优先访问顺序。
+        const stack = [];
+        if (rootId) {
+            stack.push(rootId);
+        } else {
+            for (let i = mappingKeys.length - 1; i >= 0; i--) {
+                stack.push(mappingKeys[i]);
+            }
+        }
+
+        while (stack.length > 0) {
+            const nodeId = stack.pop();
+            if (!nodeId || visited.has(nodeId)) continue;
             visited.add(nodeId);
+
             const node = mapping[nodeId];
-            if (!node) return;
+            if (!node) continue;
 
             const msg = node.message;
             if (msg) {
@@ -493,14 +509,13 @@
             }
 
             if (Array.isArray(node.children)) {
-                node.children.forEach(childId => traverse(childId));
+                for (let i = node.children.length - 1; i >= 0; i--) {
+                    const childId = node.children[i];
+                    if (childId && !visited.has(childId)) {
+                        stack.push(childId);
+                    }
+                }
             }
-        };
-
-        if (rootId) {
-            traverse(rootId);
-        } else {
-            mappingKeys.forEach(traverse);
         }
 
         return messages;
@@ -952,24 +967,118 @@ html.dark #gre-fab-status {
 
     // --- 导出流程核心逻辑 ---
 
-    async function addConversationToZip(target, convData, workspaceId, report = null) {
-        target.file(generateUniqueFilename(convData), JSON.stringify(convData, null, 2));
-        if (!report) {
-            target.file(generateMarkdownFilename(convData), convertConversationToMarkdown(convData));
-            return;
-        }
-        const attachmentResult = await appendAttachmentsToZip(target, convData, workspaceId);
-        target.file(generateMarkdownFilename(convData), convertConversationToMarkdown(convData, attachmentResult));
-        report.detected += attachmentResult.detected;
-        report.downloaded += attachmentResult.files.length;
-        report.failed += attachmentResult.failures.length;
-        report.conversations.push({
-            conversation_id: convData?.conversation_id || null,
-            title: convData?.title || 'Untitled Conversation',
-            detected: attachmentResult.detected,
-            downloaded: attachmentResult.files,
-            failures: attachmentResult.failures
+    function recordExportIssue(exportErrorReport, details = {}) {
+        if (!exportErrorReport) return;
+        exportErrorReport.issues.push({
+            conversation_id: details.conversation_id || null,
+            title: details.title || 'Untitled Conversation',
+            stage: details.stage || 'unknown',
+            error: details.error || 'Unknown error',
+            timestamp: new Date().toISOString()
         });
+    }
+
+    function buildMarkdownErrorPlaceholder(convData, error) {
+        const title = convData?.title || 'Untitled Conversation';
+        const conversationId = convData?.conversation_id || 'unknown';
+        const message = error?.message || String(error);
+        return [
+            '# Markdown export warning',
+            '',
+            `Conversation: ${title}`,
+            `Conversation ID: ${conversationId}`,
+            '',
+            'The original conversation JSON was exported successfully, but Markdown conversion failed.',
+            `Error: ${message}`,
+            '',
+            'Please use the JSON file in this ZIP as the lossless backup for this conversation.',
+            ''
+        ].join('\n');
+    }
+
+    async function addConversationToZip(target, convData, workspaceId, attachmentReport = null, exportErrorReport = null) {
+        // JSON 是无损备份，优先写入；Markdown/附件即使失败也不能影响 JSON 保存。
+        target.file(generateUniqueFilename(convData), JSON.stringify(convData, null, 2));
+
+        let attachmentResult = null;
+        let partial = false;
+
+        if (attachmentReport) {
+            try {
+                attachmentResult = await appendAttachmentsToZip(target, convData, workspaceId);
+            } catch (error) {
+                partial = true;
+                attachmentResult = { detected: 0, files: [], failures: [], sandboxPaths: new Map() };
+                recordExportIssue(exportErrorReport, {
+                    conversation_id: convData?.conversation_id,
+                    title: convData?.title,
+                    stage: 'attachments',
+                    error: error?.message || String(error)
+                });
+                console.error('[ChatGPT Exporter] 附件导出异常，继续导出会话正文:', convData?.conversation_id, error);
+            }
+        }
+
+        try {
+            target.file(
+                generateMarkdownFilename(convData),
+                convertConversationToMarkdown(convData, attachmentResult)
+            );
+        } catch (error) {
+            partial = true;
+            target.file(generateMarkdownFilename(convData), buildMarkdownErrorPlaceholder(convData, error));
+            recordExportIssue(exportErrorReport, {
+                conversation_id: convData?.conversation_id,
+                title: convData?.title,
+                stage: 'markdown',
+                error: error?.message || String(error)
+            });
+            console.error('[ChatGPT Exporter] Markdown 转换失败，已保留 JSON 并继续:', convData?.conversation_id, error);
+        }
+
+        if (attachmentReport && attachmentResult) {
+            attachmentReport.detected += attachmentResult.detected;
+            attachmentReport.downloaded += attachmentResult.files.length;
+            attachmentReport.failed += attachmentResult.failures.length;
+            attachmentReport.conversations.push({
+                conversation_id: convData?.conversation_id || null,
+                title: convData?.title || 'Untitled Conversation',
+                detected: attachmentResult.detected,
+                downloaded: attachmentResult.files,
+                failures: attachmentResult.failures
+            });
+        }
+
+        return { partial };
+    }
+
+    async function exportConversationSafely(target, conversationId, workspaceId, attachmentReport, exportErrorReport, titleHint = '') {
+        try {
+            const convData = await getConversation(conversationId, workspaceId);
+            const result = await addConversationToZip(
+                target,
+                convData,
+                workspaceId,
+                attachmentReport,
+                exportErrorReport
+            );
+            if (result?.partial) {
+                exportErrorReport.partial += 1;
+            } else {
+                exportErrorReport.succeeded += 1;
+            }
+            return true;
+        } catch (error) {
+            exportErrorReport.failed += 1;
+            recordExportIssue(exportErrorReport, {
+                conversation_id: conversationId,
+                title: titleHint || 'Untitled Conversation',
+                stage: 'conversation',
+                error: error?.message || String(error)
+            });
+            console.error('[ChatGPT Exporter] 单个会话导出失败，已跳过并继续:', conversationId, error);
+            return false;
+        }
     }
 
     async function exportConversations(options = {}) {
@@ -999,16 +1108,30 @@ html.dark #gre-fab-status {
                 failed: 0,
                 conversations: []
             } : null;
+            const exportErrorReport = {
+                exporter_version: ATTACHMENT_EXPORT_VERSION,
+                generated_at: new Date().toISOString(),
+                succeeded: 0,
+                partial: 0,
+                failed: 0,
+                issues: []
+            };
             if (Array.isArray(conversationEntries) && conversationEntries.length > 0) {
                 for (let i = 0; i < conversationEntries.length; i++) {
                     const entry = conversationEntries[i];
                     const label = entry?.title ? entry.title.slice(0, 12) : '对话';
                     setFabStatus(btn, `📥 ${label} (${i + 1}/${conversationEntries.length})`);
-                    const convData = await getConversation(entry.id, workspaceId);
                     const target = entry?.projectTitle
                         ? zip.folder(sanitizeFilename(entry.projectTitle))
                         : zip;
-                    await addConversationToZip(target, convData, workspaceId, attachmentReport);
+                    await exportConversationSafely(
+                        target,
+                        entry.id,
+                        workspaceId,
+                        attachmentReport,
+                        exportErrorReport,
+                        entry?.title || ''
+                    );
                     await sleep(jitter());
                 }
             } else {
@@ -1016,8 +1139,13 @@ html.dark #gre-fab-status {
                 const orphanIds = await collectIds(btn, workspaceId, null);
                 for (let i = 0; i < orphanIds.length; i++) {
                     setFabStatus(btn, `📥 根目录 (${i + 1}/${orphanIds.length})`);
-                    const convData = await getConversation(orphanIds[i], workspaceId);
-                    await addConversationToZip(zip, convData, workspaceId, attachmentReport);
+                    await exportConversationSafely(
+                        zip,
+                        orphanIds[i],
+                        workspaceId,
+                        attachmentReport,
+                        exportErrorReport
+                    );
                     await sleep(jitter());
                 }
 
@@ -1031,8 +1159,14 @@ html.dark #gre-fab-status {
 
                     for (let i = 0; i < projectConvIds.length; i++) {
                         setFabStatus(btn, `📥 ${project.title.substring(0,10)}... (${i + 1}/${projectConvIds.length})`);
-                        const convData = await getConversation(projectConvIds[i], workspaceId);
-                        await addConversationToZip(projectFolder, convData, workspaceId, attachmentReport);
+                        await exportConversationSafely(
+                            projectFolder,
+                            projectConvIds[i],
+                            workspaceId,
+                            attachmentReport,
+                            exportErrorReport,
+                            project.title
+                        );
                         await sleep(jitter());
                     }
                 }
@@ -1040,6 +1174,9 @@ html.dark #gre-fab-status {
 
             if (attachmentReport) {
                 zip.file('attachment-export-report.json', JSON.stringify(attachmentReport, null, 2));
+            }
+            if (exportErrorReport.issues.length > 0) {
+                zip.file('export-error-report.json', JSON.stringify(exportErrorReport, null, 2));
             }
             setFabStatus(btn, '📦 生成 ZIP 文件…');
             const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
@@ -1063,8 +1200,11 @@ html.dark #gre-fab-status {
             const attachmentSummary = attachmentReport
                 ? `\n附件：检测 ${attachmentReport.detected}，成功 ${attachmentReport.downloaded}，失败 ${attachmentReport.failed}。`
                 : '';
-            alert(`✅ 导出完成！${attachmentSummary}`);
-            setFabStatus(btn, '✅ 完成');
+            const errorSummary = exportErrorReport.issues.length > 0
+                ? `\n会话：成功 ${exportErrorReport.succeeded}，部分成功 ${exportErrorReport.partial}，失败 ${exportErrorReport.failed}。错误详情已写入 export-error-report.json。`
+                : `\n会话：成功 ${exportErrorReport.succeeded}，无错误。`;
+            alert(`✅ 导出完成！${attachmentSummary}${errorSummary}`);
+            setFabStatus(btn, exportErrorReport.issues.length > 0 ? '✅ 完成（有警告）' : '✅ 完成');
 
         } catch (e) {
             console.error("导出过程中发生严重错误:", e);

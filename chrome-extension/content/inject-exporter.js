@@ -1,5 +1,6 @@
 (function injectExporter() {
-    const EXPECTED_VERSION = '1.5.0';
+    // 版本号以 manifest 为准，避免多处硬编码导致升级时不同步
+    const EXPECTED_VERSION = chrome.runtime.getManifest().version;
     const activeVersion = document.documentElement.getAttribute('data-chatgpt-exporter-version');
     if (window.__CHATGPT_EXPORTER_INJECTED__ === EXPECTED_VERSION && activeVersion === EXPECTED_VERSION) return;
     window.__CHATGPT_EXPORTER_INJECTED__ = EXPECTED_VERSION;

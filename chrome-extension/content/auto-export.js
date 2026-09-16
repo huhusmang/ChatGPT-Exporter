@@ -1,7 +1,8 @@
 (function () {
     const EXPORT_READY_EVENT = 'CHATGPT_EXPORTER_READY';
     const COMMAND_TYPE = 'CHATGPT_EXPORTER_COMMAND';
-    const EXPECTED_VERSION = '1.5.0';
+    // 版本号以 manifest 为准，避免多处硬编码导致升级时不同步
+    const EXPECTED_VERSION = chrome.runtime.getManifest().version;
     let exporterReady = false;
     const pendingCommands = [];
 

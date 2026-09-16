@@ -1,7 +1,8 @@
 import { normalizeSettings, calculateNextTrigger } from '../utils/schedule.js';
 import { storage, tabs } from '../utils/chrome-helpers.js';
 
-const EXPECTED_EXPORTER_VERSION = '1.5.0';
+// 版本号以 manifest 为准，避免多处硬编码导致升级时不同步
+const EXPECTED_EXPORTER_VERSION = chrome.runtime.getManifest().version;
 
 const nextRunEl = document.getElementById('next-run');
 const reminderNoteEl = document.getElementById('reminder-note');

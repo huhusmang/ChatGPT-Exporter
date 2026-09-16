@@ -70,6 +70,137 @@
     // --- 辅助函数 ---
     const sleep = ms => new Promise(r => setTimeout(r, ms));
     const jitter = () => BASE_DELAY + Math.random() * JITTER;
+
+    // --- 速率限制：backend-api 请求统一经 apiFetch 串行限速，遇 429/5xx 自动退避重试 ---
+    const RATE_LIMIT_MIN_INTERVAL = 1000;   // 相邻两次 API 请求的最小间隔（毫秒）
+    const RATE_LIMIT_MAX_RETRIES = 5;       // 遇到 429/可重试状态码时的最大重试次数
+    const RATE_LIMIT_BASE_BACKOFF = 2000;   // 首次重试的基础等待（毫秒）
+    const RATE_LIMIT_MAX_BACKOFF = 60000;   // 指数退避的等待上限（毫秒）
+
+    let rateLimitNextSlotAt = 0;            // 下一个可用的请求时间槽
+    let rateLimitChain = Promise.resolve(); // 串行化所有 API 请求，避免并发触发限流
+
+    // 预约下一个请求时间槽，返回需要等待的毫秒数
+    function reserveRateLimitSlot() {
+        const now = Date.now();
+        const slot = Math.max(now, rateLimitNextSlotAt);
+        rateLimitNextSlotAt = slot + RATE_LIMIT_MIN_INTERVAL;
+        return slot - now;
+    }
+
+    function isRetryableStatus(status) {
+        return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+    }
+
+    function parseRetryAfter(response) {
+        const raw = response?.headers?.get('retry-after');
+        if (!raw) return null;
+        const seconds = Number(raw);
+        if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+        const date = Date.parse(raw);
+        return Number.isNaN(date) ? null : Math.max(0, date - Date.now());
+    }
+
+    function backoffDelay(retry) {
+        const exp = Math.min(RATE_LIMIT_BASE_BACKOFF * 2 ** retry, RATE_LIMIT_MAX_BACKOFF);
+        return exp / 2 + Math.random() * (exp / 2);
+    }
+
+    // 串行 + 限速地执行一次 GET/fetch；429 优先遵循 Retry-After，否则指数退避
+    function apiFetch(url, options = {}, label = 'API 请求') {
+        const attempt = async () => {
+            await sleep(reserveRateLimitSlot());
+            for (let retry = 0; ; retry++) {
+                let response;
+                try {
+                    response = await fetch(url, options);
+                } catch (error) {
+                    if (retry >= RATE_LIMIT_MAX_RETRIES) throw error;
+                    console.warn(`⏳ [速率限制] ${label} 网络异常，${Math.round(backoffDelay(retry) / 1000)}s 后重试 (${retry + 1}/${RATE_LIMIT_MAX_RETRIES})`);
+                    await sleep(backoffDelay(retry));
+                    continue;
+                }
+                if (response.ok || !isRetryableStatus(response.status) || retry >= RATE_LIMIT_MAX_RETRIES) {
+                    if (retry > 0) response.__rateLimitRetries = retry;
+                    return response;
+                }
+                const retryAfter = parseRetryAfter(response);
+                const waitMs = retryAfter !== null ? retryAfter : backoffDelay(retry);
+                console.warn(`⏳ [速率限制] ${label} 返回 ${response.status}，等待 ${Math.round(waitMs / 1000)}s 后重试 (${retry + 1}/${RATE_LIMIT_MAX_RETRIES})`);
+                await sleep(waitMs);
+            }
+        };
+        const result = rateLimitChain.then(attempt, attempt);
+        // 失败不阻断后续请求的排队
+        rateLimitChain = result.then(() => {}, () => {});
+        return result;
+    }
+
+    // --- 断点续传：已完成的对话写入 IndexedDB，中断后重新导出可跳过已缓存部分 ---
+    const RESUME_DB_NAME = 'chatgpt-exporter-resume';
+    const RESUME_DB_VERSION = 1;
+    const RESUME_RECORD_STORE = 'records';
+
+    function openResumeDb() {
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open(RESUME_DB_NAME, RESUME_DB_VERSION);
+            request.onupgradeneeded = () => {
+                const db = request.result;
+                if (!db.objectStoreNames.contains(RESUME_RECORD_STORE)) {
+                    db.createObjectStore(RESUME_RECORD_STORE);
+                }
+            };
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    function idbRequest(request) {
+        return new Promise((resolve, reject) => {
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    async function resumeDb(mode, run) {
+        const db = await openResumeDb();
+        try {
+            const tx = db.transaction(RESUME_RECORD_STORE, mode);
+            const result = await run(tx.objectStore(RESUME_RECORD_STORE));
+            await new Promise((resolve, reject) => {
+                tx.oncomplete = resolve;
+                tx.onerror = () => reject(tx.error);
+                tx.onabort = () => reject(tx.error);
+            });
+            return result;
+        } finally {
+            db.close();
+        }
+    }
+
+    const resumeRecordKey = (sessionKey, convId) => `${sessionKey}|${convId}`;
+    const resumeRecordRange = (sessionKey) => IDBKeyRange.bound(`${sessionKey}|`, `${sessionKey}|\uffff`, false, false);
+
+    // 缓存按“空间+是否含附件”隔离，避免不同导出类型互相污染
+    function getSessionKey(mode, workspaceId, includeAttachments) {
+        return `${mode}:${workspaceId || 'personal'}:${includeAttachments ? 'att' : 'plain'}`;
+    }
+
+    function resumeGetRecord(sessionKey, convId) {
+        return resumeDb('readonly', store => idbRequest(store.get(resumeRecordKey(sessionKey, convId))));
+    }
+
+    function resumeSaveRecord(sessionKey, record) {
+        return resumeDb('readwrite', store => idbRequest(store.put(record, resumeRecordKey(sessionKey, record.id))));
+    }
+
+    function resumeCountRecords(sessionKey) {
+        return resumeDb('readonly', store => idbRequest(store.count(resumeRecordRange(sessionKey))));
+    }
+
+    function resumeClearSession(sessionKey) {
+        return resumeDb('readwrite', store => idbRequest(store.delete(resumeRecordRange(sessionKey))));
+    }
     const sanitizeFilename = (name) => name.replace(/[\/\\?%*:|"<>]/g, '-').trim();
     const normalizeEpochSeconds = (value) => {
         if (!value) return 0;
@@ -129,7 +260,7 @@
             : `${jsonName}.md`;
     }
 
-    const ATTACHMENT_EXPORT_VERSION = '1.5.0';
+    const ATTACHMENT_EXPORT_VERSION = '1.6.0';
     const EXPORT_BUTTON_LABEL = `Export Conversations v${ATTACHMENT_EXPORT_VERSION}`;
     const MIME_EXTENSIONS = {
         'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp',
@@ -179,38 +310,6 @@
         return match ? match[0] : null;
     }
 
-    function getActiveConversationNodes(convData) {
-        const mapping = convData?.mapping;
-        if (!mapping || typeof mapping !== 'object') return [];
-
-        const entries = Object.entries(mapping);
-        if (entries.length === 0) return [];
-
-        let currentNodeId = convData?.current_node;
-        if (!currentNodeId || !mapping[currentNodeId]) {
-            const leaves = entries
-                .filter(([, node]) => !Array.isArray(node?.children) || node.children.length === 0)
-                .sort(([, a], [, b]) => {
-                    const aTime = Number(a?.message?.create_time) || 0;
-                    const bTime = Number(b?.message?.create_time) || 0;
-                    return bTime - aTime;
-                });
-            currentNodeId = leaves[0]?.[0] || entries[entries.length - 1][0];
-            console.warn('Conversation current_node is unavailable; exporting the latest leaf path instead.');
-        }
-
-        const path = [];
-        const visited = new Set();
-        while (currentNodeId && !visited.has(currentNodeId)) {
-            visited.add(currentNodeId);
-            const node = mapping[currentNodeId];
-            if (!node) break;
-            path.push(node);
-            currentNodeId = node.parent || null;
-        }
-        return path.reverse();
-    }
-
     function collectVisibleAttachments(convData) {
         const references = new Map();
         const add = (reference) => {
@@ -220,7 +319,7 @@
             if (!references.has(key)) references.set(key, reference);
         };
 
-        getActiveConversationNodes(convData).forEach(node => {
+        Object.values(convData?.mapping || {}).forEach(node => {
             const message = node?.message;
             if (!message) return;
             const role = message.author?.role;
@@ -296,7 +395,7 @@
             metadataUrl = `/backend-api/files/download/${encodeURIComponent(reference.fileId)}?inline=false`;
         }
 
-        const metadataResponse = await fetch(metadataUrl, { credentials: 'include', headers });
+        const metadataResponse = await apiFetch(metadataUrl, { credentials: 'include', headers }, `附件元数据 ${reference.fileId || reference.sandboxPath}`);
         if (!metadataResponse.ok) throw new Error(`metadata HTTP ${metadataResponse.status}`);
         const contentType = metadataResponse.headers.get('content-type') || '';
         if (!contentType.includes('json')) {
@@ -325,13 +424,17 @@
         return path.split('/').map(segment => encodeURIComponent(segment)).join('/');
     }
 
+    function zipFolderName(convData) {
+        return generateUniqueFilename(convData).replace(/\.json$/i, '') + '_files';
+    }
+
     async function appendAttachmentsToZip(target, convData, workspaceId) {
         const references = collectVisibleAttachments(convData);
         const failures = [];
         const files = [];
         const sandboxPaths = new Map();
         const usedNames = new Set();
-        const folderName = generateUniqueFilename(convData).replace(/\.json$/i, '') + '_files';
+        const folderName = zipFolderName(convData);
 
         for (const reference of references) {
             try {
@@ -345,7 +448,8 @@
                     kind: reference.kind,
                     isImage: reference.isImage,
                     messageId: reference.messageId,
-                    ownerRole: reference.ownerRole
+                    ownerRole: reference.ownerRole,
+                    data: downloaded.data
                 });
                 if (reference.kind === 'sandbox') {
                     sandboxPaths.set(`${reference.messageId}|${reference.sandboxPath}`, relativePath);
@@ -381,14 +485,14 @@
             .trim();
     }
 
-    function processContentReferences(text, contentReferences, referenceStartIndex = 1) {
+    function processContentReferences(text, contentReferences) {
         if (!text || !Array.isArray(contentReferences) || contentReferences.length === 0) {
-            return { text, footnotes: [], nextReferenceIndex: referenceStartIndex };
+            return { text, footnotes: [] };
         }
 
         const references = contentReferences.filter(ref => ref && typeof ref.matched_text === 'string' && ref.matched_text.length > 0);
         if (references.length === 0) {
-            return { text, footnotes: [], nextReferenceIndex: referenceStartIndex };
+            return { text, footnotes: [] };
         }
 
         const getReferenceInfo = (ref) => {
@@ -419,7 +523,7 @@
             if (!info.url) return;
             const key = `${info.url}|${info.title}`;
             if (footnoteIndexByKey.has(key)) return;
-            const index = referenceStartIndex + footnotes.length;
+            const index = footnotes.length + 1;
             footnoteIndexByKey.set(key, index);
             footnotes.push({ index, url: info.url, title: info.title, label: info.label });
         });
@@ -461,64 +565,79 @@
             output = output.split(ref.matched_text).join(replacement);
         });
 
-        return {
-            text: output,
-            footnotes,
-            nextReferenceIndex: referenceStartIndex + footnotes.length
-        };
+        return { text: output, footnotes };
     }
 
     function extractConversationMessages(convData, attachmentResult = null) {
+        const mapping = convData?.mapping;
+        if (!mapping) return [];
+
         const messages = [];
-        const nodes = getActiveConversationNodes(convData);
-        let nextReferenceIndex = 1;
+        const mappingKeys = Object.keys(mapping);
+        const rootId = mapping['client-created-root']
+            ? 'client-created-root'
+            : mappingKeys.find(id => !mapping[id]?.parent) || mappingKeys[0];
+        const visited = new Set();
 
-        nodes.forEach(node => {
-            const msg = node?.message;
-            if (!msg) return;
+        const traverse = (nodeId) => {
+            if (!nodeId || visited.has(nodeId)) return;
+            visited.add(nodeId);
+            const node = mapping[nodeId];
+            if (!node) return;
 
-            const author = msg.author?.role;
-            const isHidden = msg.metadata?.is_visually_hidden_from_conversation ||
-                msg.metadata?.is_contextual_answers_system_message;
-            if ((author !== 'user' && author !== 'assistant') || isHidden) return;
-
-            const content = msg.content;
-            if ((content?.content_type !== 'text' && content?.content_type !== 'multimodal_text') || !Array.isArray(content.parts)) return;
-
-            const rawText = content.parts
-                .map(part => typeof part === 'string' ? part : (part?.text ?? ''))
-                .filter(Boolean)
-                .join('\n');
-            const contentReferences = msg.metadata?.content_references || [];
-            let processedText = rawText;
-            let footnotes = [];
-            if (Array.isArray(contentReferences) && contentReferences.length > 0) {
-                const processed = processContentReferences(rawText, contentReferences, nextReferenceIndex);
-                processedText = processed.text;
-                footnotes = processed.footnotes;
-                nextReferenceIndex = processed.nextReferenceIndex;
+            const msg = node.message;
+            if (msg) {
+                const author = msg.author?.role;
+                const isHidden = msg.metadata?.is_visually_hidden_from_conversation ||
+                    msg.metadata?.is_contextual_answers_system_message;
+                if ((author === 'user' || author === 'assistant') && !isHidden) {
+                    const content = msg.content;
+                    if ((content?.content_type === 'text' || content?.content_type === 'multimodal_text') && Array.isArray(content.parts)) {
+                        const rawText = content.parts
+                            .map(part => typeof part === 'string' ? part : (part?.text ?? ''))
+                            .filter(Boolean)
+                            .join('\n');
+                        const contentReferences = msg.metadata?.content_references || [];
+                        let processedText = rawText;
+                        let footnotes = [];
+                        if (Array.isArray(contentReferences) && contentReferences.length > 0) {
+                            const processed = processContentReferences(rawText, contentReferences);
+                            processedText = processed.text;
+                            footnotes = processed.footnotes;
+                        }
+                        const cleaned = cleanMessageContent(
+                            replaceDownloadedSandboxLinks(processedText, attachmentResult?.sandboxPaths, msg.id)
+                        );
+                        const attachmentLines = (attachmentResult?.files || [])
+                            .filter(file => file.messageId === msg.id && file.kind !== 'sandbox')
+                            .map(file => {
+                                const label = file.name.replace(/[\[\]]/g, '\\$&');
+                                return file.isImage ? `![${label}](${file.path})` : `📎 [${label}](${file.path})`;
+                            });
+                        const renderedContent = [cleaned, ...attachmentLines].filter(Boolean).join('\n\n');
+                        if (renderedContent) {
+                            messages.push({
+                                role: author,
+                                content: renderedContent,
+                                messageId: msg.id,
+                                create_time: msg.create_time || null,
+                                footnotes
+                            });
+                        }
+                    }
+                }
             }
 
-            const cleaned = cleanMessageContent(
-                replaceDownloadedSandboxLinks(processedText, attachmentResult?.sandboxPaths, msg.id)
-            );
-            const attachmentLines = (attachmentResult?.files || [])
-                .filter(file => file.messageId === msg.id && file.kind !== 'sandbox')
-                .map(file => {
-                    const label = file.name.replace(/[\[\]]/g, '\\$&');
-                    return file.isImage ? `![${label}](${file.path})` : `📎 [${label}](${file.path})`;
-                });
-            const renderedContent = [cleaned, ...attachmentLines].filter(Boolean).join('\n\n');
-            if (!renderedContent) return;
+            if (Array.isArray(node.children)) {
+                node.children.forEach(childId => traverse(childId));
+            }
+        };
 
-            messages.push({
-                role: author,
-                content: renderedContent,
-                messageId: msg.id,
-                create_time: msg.create_time || null,
-                footnotes
-            });
-        });
+        if (rootId) {
+            traverse(rootId);
+        } else {
+            mappingKeys.forEach(traverse);
+        }
 
         return messages;
     }
@@ -969,24 +1088,44 @@ html.dark #gre-fab-status {
 
     // --- 导出流程核心逻辑 ---
 
-    async function addConversationToZip(target, convData, workspaceId, report = null) {
-        target.file(generateUniqueFilename(convData), JSON.stringify(convData, null, 2));
-        if (!report) {
-            target.file(generateMarkdownFilename(convData), convertConversationToMarkdown(convData));
-            return;
-        }
-        const attachmentResult = await appendAttachmentsToZip(target, convData, workspaceId);
-        target.file(generateMarkdownFilename(convData), convertConversationToMarkdown(convData, attachmentResult));
-        report.detected += attachmentResult.detected;
-        report.downloaded += attachmentResult.files.length;
-        report.failed += attachmentResult.failures.length;
-        report.conversations.push({
-            conversation_id: convData?.conversation_id || null,
-            title: convData?.title || 'Untitled Conversation',
-            detected: attachmentResult.detected,
-            downloaded: attachmentResult.files,
-            failures: attachmentResult.failures
+    // 从缓存记录恢复附件文件到 ZIP（文件二进制随记录一起缓存过）
+    function restoreCachedAttachments(target, convData, record) {
+        const attachmentResult = record.attachmentResult;
+        const folder = target.folder(zipFolderName(convData));
+        attachmentResult.files.forEach(file => {
+            if (file?.data) folder.file(file.name, file.data);
         });
+        return {
+            ...attachmentResult,
+            sandboxPaths: attachmentResult.sandboxPaths instanceof Map
+                ? attachmentResult.sandboxPaths
+                : new Map(Object.entries(attachmentResult.sandboxPaths || {}))
+        };
+    }
+
+    // 返回 attachmentResult（含附件二进制），供断点续传缓存使用
+    async function addConversationToZip(target, convData, workspaceId, report = null, cachedRecord = null) {
+        target.file(generateUniqueFilename(convData), JSON.stringify(convData, null, 2));
+        let attachmentResult = null;
+        if (report) {
+            attachmentResult = cachedRecord?.attachmentResult
+                ? restoreCachedAttachments(target, convData, cachedRecord)
+                : await appendAttachmentsToZip(target, convData, workspaceId);
+            if (cachedRecord) report.cached = (report.cached || 0) + 1;
+            report.detected += attachmentResult.detected;
+            report.downloaded += attachmentResult.files.length;
+            report.failed += attachmentResult.failures.length;
+            report.conversations.push({
+                conversation_id: convData?.conversation_id || null,
+                title: convData?.title || 'Untitled Conversation',
+                cached: Boolean(cachedRecord),
+                detected: attachmentResult.detected,
+                downloaded: attachmentResult.files.map(({ data, ...rest }) => rest),
+                failures: attachmentResult.failures
+            });
+        }
+        target.file(generateMarkdownFilename(convData), convertConversationToMarkdown(convData, attachmentResult));
+        return attachmentResult;
     }
 
     async function exportConversations(options = {}) {
@@ -1006,6 +1145,30 @@ html.dark #gre-fab-status {
             return;
         }
 
+        // --- 断点续传：检测上次未完成导出的本地缓存 ---
+        const sessionKey = getSessionKey(mode, workspaceId, includeAttachments);
+        let resumeEnabled = false;
+        try {
+            const cachedCount = await resumeCountRecords(sessionKey);
+            if (cachedCount > 0) {
+                resumeEnabled = confirm(
+                    `检测到上次导出未完成，本地已缓存 ${cachedCount} 个对话。\n` +
+                    '是否断点续传？将跳过已缓存的对话，只补抓剩余部分。\n' +
+                    '（点击“取消”将清除缓存并重新导出全部）'
+                );
+                if (!resumeEnabled) {
+                    await resumeClearSession(sessionKey);
+                }
+            }
+        } catch (err) {
+            console.warn('[ChatGPT Exporter] 断点续传缓存不可用:', err);
+        }
+
+        // 单个对话失败只记录并跳过，不再中断整个导出；失败部分可通过续传补抓
+        const failedConversations = [];
+        let reusedCount = 0;
+        let savedThisRun = 0;
+
         try {
             const zip = new JSZip();
             const attachmentReport = includeAttachments ? {
@@ -1014,45 +1177,75 @@ html.dark #gre-fab-status {
                 detected: 0,
                 downloaded: 0,
                 failed: 0,
+                cached: 0,
                 conversations: []
             } : null;
+
+            const tasks = [];
             if (Array.isArray(conversationEntries) && conversationEntries.length > 0) {
-                for (let i = 0; i < conversationEntries.length; i++) {
-                    const entry = conversationEntries[i];
-                    const label = entry?.title ? entry.title.slice(0, 12) : '对话';
-                    setFabStatus(btn, `📥 ${label} (${i + 1}/${conversationEntries.length})`);
-                    const convData = await getConversation(entry.id, workspaceId);
-                    const target = entry?.projectTitle
-                        ? zip.folder(sanitizeFilename(entry.projectTitle))
-                        : zip;
-                    await addConversationToZip(target, convData, workspaceId, attachmentReport);
-                    await sleep(jitter());
-                }
+                conversationEntries.forEach(entry => {
+                    tasks.push({
+                        id: entry.id,
+                        projectTitle: entry?.projectTitle || null,
+                        label: entry?.title ? entry.title.slice(0, 12) : '对话'
+                    });
+                });
             } else {
                 setFabStatus(btn, '📂 获取项目外对话…');
                 const orphanIds = await collectIds(btn, workspaceId, null);
-                for (let i = 0; i < orphanIds.length; i++) {
-                    setFabStatus(btn, `📥 根目录 (${i + 1}/${orphanIds.length})`);
-                    const convData = await getConversation(orphanIds[i], workspaceId);
-                    await addConversationToZip(zip, convData, workspaceId, attachmentReport);
-                    await sleep(jitter());
-                }
+                orphanIds.forEach(id => tasks.push({ id, projectTitle: null, label: '根目录' }));
 
                 setFabStatus(btn, '🔍 获取项目列表…');
                 const projects = await getProjects(workspaceId);
                 for (const project of projects) {
-                    const projectFolder = zip.folder(sanitizeFilename(project.title));
                     setFabStatus(btn, `📂 项目: ${project.title}`);
                     const projectConvIds = await collectIds(btn, workspaceId, project.id);
-                    if (projectConvIds.length === 0) continue;
+                    projectConvIds.forEach(id => tasks.push({ id, projectTitle: project.title, label: project.title }));
+                }
+            }
 
-                    for (let i = 0; i < projectConvIds.length; i++) {
-                        setFabStatus(btn, `📥 ${project.title.substring(0,10)}... (${i + 1}/${projectConvIds.length})`);
-                        const convData = await getConversation(projectConvIds[i], workspaceId);
-                        await addConversationToZip(projectFolder, convData, workspaceId, attachmentReport);
-                        await sleep(jitter());
+            for (let i = 0; i < tasks.length; i++) {
+                const task = tasks[i];
+                setFabStatus(btn, `📥 ${task.label.slice(0, 12)} (${i + 1}/${tasks.length})`);
+
+                let cachedRecord = null;
+                if (resumeEnabled) {
+                    try { cachedRecord = await resumeGetRecord(sessionKey, task.id); } catch (_) {}
+                }
+
+                let convData;
+                if (cachedRecord?.convData) {
+                    convData = cachedRecord.convData;
+                    reusedCount++;
+                } else {
+                    try {
+                        convData = await getConversation(task.id, workspaceId);
+                    } catch (error) {
+                        console.error(`[ChatGPT Exporter] 获取对话失败 ${task.id}:`, error);
+                        failedConversations.push({ id: task.id, title: task.label, error: error?.message || String(error) });
+                        continue;
                     }
                 }
+
+                const target = task.projectTitle ? zip.folder(sanitizeFilename(task.projectTitle)) : zip;
+                const attachmentResult = await addConversationToZip(target, convData, workspaceId, attachmentReport, cachedRecord);
+
+                if (!cachedRecord) {
+                    try {
+                        await resumeSaveRecord(sessionKey, {
+                            id: task.id,
+                            title: convData?.title || task.label,
+                            projectTitle: task.projectTitle,
+                            fetchedAt: new Date().toISOString(),
+                            convData,
+                            attachmentResult: attachmentResult || null
+                        });
+                        savedThisRun++;
+                    } catch (err) {
+                        console.warn('[ChatGPT Exporter] 缓存对话失败（不影响导出继续）:', err);
+                    }
+                }
+                await sleep(jitter());
             }
 
             if (attachmentReport) {
@@ -1077,15 +1270,29 @@ html.dark #gre-fab-status {
                         : `chatgpt_personal_backup_${date}.zip`;
             }
             downloadFile(blob, filename);
+            // 全部成功才清缓存；有失败时保留，下次导出同一空间即可续传补抓
+            if (failedConversations.length === 0) {
+                try { await resumeClearSession(sessionKey); } catch (_) {}
+            }
             const attachmentSummary = attachmentReport
                 ? `\n附件：检测 ${attachmentReport.detected}，成功 ${attachmentReport.downloaded}，失败 ${attachmentReport.failed}。`
                 : '';
-            alert(`✅ 导出完成！${attachmentSummary}`);
+            const cacheSummary = reusedCount > 0 ? `\n♻️ 断点续传：复用本地缓存 ${reusedCount} 个对话。` : '';
+            const failureSummary = failedConversations.length > 0
+                ? `\n⚠️ ${failedConversations.length} 个对话获取失败已跳过（列表见控制台）。重新导出同一空间时将自动断点续传，仅补抓失败部分。`
+                : '';
+            if (failedConversations.length > 0) {
+                console.warn('[ChatGPT Exporter] 以下对话获取失败，可稍后通过续传补抓:', failedConversations);
+            }
+            alert(`✅ 导出完成！${cacheSummary}${attachmentSummary}${failureSummary}`);
             setFabStatus(btn, '✅ 完成');
 
         } catch (e) {
             console.error("导出过程中发生严重错误:", e);
-            alert(`导出失败: ${e.message}。详情请查看控制台（F12 -> Console）。`);
+            const resumeHint = (reusedCount + savedThisRun) > 0
+                ? '\n已完成部分的缓存已保留，重新导出同一空间时将提示断点续传。'
+                : '';
+            alert(`导出失败: ${e.message}。${resumeHint}\n详情请查看控制台（F12 -> Console）。`);
             setFabStatus(btn, '⚠️ Error');
         } finally {
             setTimeout(() => {
@@ -1204,7 +1411,7 @@ html.dark #gre-fab-status {
                 query.set('cursor', cursor);
             }
 
-            const r = await fetch(`/backend-api/gizmos/snorlax/sidebar?${query.toString()}`, { headers });
+            const r = await apiFetch(`/backend-api/gizmos/snorlax/sidebar?${query.toString()}`, { headers }, '项目空间列表');
             if (!r.ok) {
                 throw new Error(`获取项目空间列表失败 (${r.status})`);
             }
@@ -1250,7 +1457,7 @@ html.dark #gre-fab-status {
         if (gizmoId) {
             let cursor = '0';
             do {
-                const r = await fetch(`/backend-api/gizmos/${gizmoId}/conversations?cursor=${cursor}`, { headers });
+                const r = await apiFetch(`/backend-api/gizmos/${gizmoId}/conversations?cursor=${cursor}`, { headers }, `项目对话列表 ${gizmoId}`);
                 if (!r.ok) throw new Error(`列举项目对话列表失败 (${r.status})`);
                 const j = await r.json();
                 j.items?.forEach(it => all.add(it.id));
@@ -1262,7 +1469,7 @@ html.dark #gre-fab-status {
                 let offset = 0, has_more = true, page = 0;
                 do {
                     setFabStatus(btn, `📂 项目外对话 (${is_archived ? 'Archived' : 'Active'} p${++page})`);
-                    const r = await fetch(`/backend-api/conversations?offset=${offset}&limit=${PAGE_LIMIT}&order=updated${is_archived ? '&is_archived=true' : ''}`, { headers });
+                    const r = await apiFetch(`/backend-api/conversations?offset=${offset}&limit=${PAGE_LIMIT}&order=updated${is_archived ? '&is_archived=true' : ''}`, { headers }, '对话列表');
                     if (!r.ok) throw new Error(`列举项目外对话列表失败 (${r.status})`);
                     const j = await r.json();
                     if (j.items && j.items.length > 0) {
@@ -1336,7 +1543,7 @@ html.dark #gre-fab-status {
             let offset = 0;
             let has_more = true;
             do {
-                const r = await fetch(`/backend-api/conversations?offset=${offset}&limit=${PAGE_LIMIT}&order=updated${is_archived ? '&is_archived=true' : ''}`, { headers });
+                const r = await apiFetch(`/backend-api/conversations?offset=${offset}&limit=${PAGE_LIMIT}&order=updated${is_archived ? '&is_archived=true' : ''}`, { headers }, '对话列表');
                 if (!r.ok) throw new Error(`列举对话列表失败 (${r.status})`);
                 const j = await r.json();
                 if (j.items && j.items.length > 0) {
@@ -1355,7 +1562,7 @@ html.dark #gre-fab-status {
             for (const project of projects) {
                 let cursor = '0';
                 do {
-                    const r = await fetch(`/backend-api/gizmos/${project.id}/conversations?cursor=${cursor}`, { headers });
+                    const r = await apiFetch(`/backend-api/gizmos/${project.id}/conversations?cursor=${cursor}`, { headers }, `项目对话列表 ${project.title}`);
                     if (!r.ok) throw new Error(`列举项目对话列表失败 (${r.status})`);
                     const j = await r.json();
                     j.items?.forEach(it => addEntry(it, { projectId: project.id, projectTitle: project.title }));
@@ -1393,7 +1600,7 @@ html.dark #gre-fab-status {
             let cursor = '0';
             let fetched = false;
             do {
-                const r = await fetch(`/backend-api/gizmos/${project.id}/conversations?cursor=${cursor}`, { headers });
+                const r = await apiFetch(`/backend-api/gizmos/${project.id}/conversations?cursor=${cursor}`, { headers }, `项目空间对话列表 ${project.title}`);
                 if (!r.ok) {
                     if (!fetched && Array.isArray(project.conversations) && project.conversations.length > 0) {
                         console.warn(`项目空间对话列表请求失败 (${r.status})，使用侧边栏返回的预览对话。`);
@@ -1432,10 +1639,11 @@ html.dark #gre-fab-status {
         };
         const resolvedWorkspaceId = resolveWorkspaceId(workspaceId);
         if (resolvedWorkspaceId) { headers['ChatGPT-Account-Id'] = resolvedWorkspaceId; }
-        const r = await fetch(`/backend-api/conversation/${id}`, { headers });
+        const r = await apiFetch(`/backend-api/conversation/${id}`, { headers }, `对话详情 ${id}`);
         if (!r.ok) {
             if (r.status === 429) {
-                throw new Error(`获取对话详情失败 conv ${id}：官方接口限流 (429)。请降低导出频率、减少单次导出的对话数量，等待几分钟后再试。`);
+                const retryNote = r.__rateLimitRetries > 0 ? `已自动退避重试 ${r.__rateLimitRetries} 次仍被限流，` : '';
+                throw new Error(`获取对话详情失败 conv ${id}：官方接口限流 (429)，${retryNote}请降低导出频率、减少单次导出的对话数量，等待几分钟后再试。`);
             }
             throw new Error(`获取对话详情失败 conv ${id} (${r.status})`);
         }

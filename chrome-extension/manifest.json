@@ -2,13 +2,14 @@
   "manifest_version": 3,
   "name": "ChatGPT Universal Exporter",
   "description": "Export ChatGPT conversations with visible uploads and generated files as JSON+Markdown ZIP backups.",
-  "version": "1.5.0",
+  "version": "2.0",
   "permissions": [
     "storage",
     "alarms",
     "notifications",
     "tabs",
-    "scripting"
+    "scripting",
+    "downloads"
   ],
   "host_permissions": [
     "https://chatgpt.com/*",

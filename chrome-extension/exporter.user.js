@@ -4,10 +4,18 @@
     // --- 配置与全局变量 ---
     const BASE_DELAY = 600;
     const JITTER = 400;
+    // 所有 ChatGPT 后端数据请求共用这一节奏；10–15 秒接近人工查看一项内容的速度。
+    const HUMAN_REQUEST_MIN_DELAY = 10 * 1000;
+    const HUMAN_REQUEST_MAX_DELAY = 15 * 1000;
+    const RATE_LIMIT_INITIAL_DELAY = 1 * 60 * 1000;
+    const RATE_LIMIT_MAX_DELAY = 15 * 60 * 1000;
     const PAGE_LIMIT = 100;
     const PROJECT_SIDEBAR_PREVIEW = 5;
     const PROJECT_SIDEBAR_LIMIT = 50;
     let accessToken = null;
+    let apiRequestChain = Promise.resolve();
+    let nextApiRequestAt = 0;
+    let rateLimitCooldownUntil = 0;
     let capturedWorkspaceIds = new Set(); // 使用Set存储网络拦截到的ID，确保唯一性
 
     // --- 核心：网络拦截与信息捕获 ---
@@ -70,7 +78,118 @@
     // --- 辅助函数 ---
     const sleep = ms => new Promise(r => setTimeout(r, ms));
     const jitter = () => BASE_DELAY + Math.random() * JITTER;
-    const sanitizeFilename = (name) => name.replace(/[\/\\?%*:|"<>]/g, '-').trim();
+
+    function requestExtension(message) {
+        return new Promise((resolve, reject) => {
+            const requestId = `exporter-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            const onResponse = (event) => {
+                if (event.source !== window || event.data?.type !== 'CHATGPT_EXPORTER_BRIDGE_RESPONSE' || event.data.requestId !== requestId) return;
+                window.removeEventListener('message', onResponse);
+                const response = event.data.response;
+                if (!response?.ok) {
+                    reject(new Error(response?.error || 'Extension request failed'));
+                    return;
+                }
+                resolve(response);
+            };
+            window.addEventListener('message', onResponse);
+            window.postMessage({ type: 'CHATGPT_EXPORTER_BRIDGE_REQUEST', requestId, message }, '*');
+        });
+    }
+
+    function textToDataUrl(text, mimeType) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = () => reject(reader.error || new Error('Unable to prepare download'));
+            reader.readAsDataURL(new Blob([text], { type: `${mimeType};charset=utf-8` }));
+        });
+    }
+
+    function getExportScope(mode, workspaceId) {
+        return `${mode}:${resolveWorkspaceId(workspaceId) || 'personal'}`;
+    }
+
+    function getExportFolder(mode, workspaceId) {
+        const scopeName = resolveWorkspaceId(workspaceId) || (mode === 'team' ? 'team' : mode === 'project' ? 'projects' : 'personal');
+        return `ChatGPT Exports/${sanitizeFilename(scopeName)}`;
+    }
+
+    const humanRequestDelay = () => HUMAN_REQUEST_MIN_DELAY
+        + Math.floor(Math.random() * (HUMAN_REQUEST_MAX_DELAY - HUMAN_REQUEST_MIN_DELAY + 1));
+
+    function formatWaitDuration(waitMs) {
+        const totalSeconds = Math.max(1, Math.ceil(waitMs / 1000));
+        const minutes = Math.floor(totalSeconds / 60);
+        const seconds = totalSeconds % 60;
+        return minutes > 0 ? `${minutes} 分 ${seconds} 秒` : `${seconds} 秒`;
+    }
+
+    function retryAfterMs(response) {
+        const raw = response?.headers?.get('retry-after');
+        if (!raw) return null;
+        const seconds = Number(raw);
+        if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+        const date = Date.parse(raw);
+        return Number.isNaN(date) ? null : Math.max(0, date - Date.now());
+    }
+
+    // 不触碰 ChatGPT 页面本身：仅让本扩展的 backend-api 请求单线程、慢速排队。
+    // 429 时保留当前请求，暂停整个队列后原地重试，绝不刷新页面或重新列举列表。
+    function humanApiFetch(url, options = {}, label = '请求', onRateLimit = null) {
+        const task = async () => {
+            let consecutiveRateLimits = 0;
+            for (;;) {
+                const requestAt = Math.max(nextApiRequestAt, rateLimitCooldownUntil);
+                const waitMs = Math.max(0, requestAt - Date.now());
+                if (waitMs > 0) await sleep(waitMs);
+                nextApiRequestAt = Date.now() + humanRequestDelay();
+
+                const response = await fetch(url, options);
+                if (response.status !== 429) return response;
+
+                consecutiveRateLimits += 1;
+                const calculatedCooldown = Math.min(
+                    RATE_LIMIT_MAX_DELAY,
+                    RATE_LIMIT_INITIAL_DELAY * (2 ** (consecutiveRateLimits - 1))
+                );
+                // 即使服务端错误地给出 0，也至少冷却一分钟，避免立刻重复请求。
+                const cooldownMs = Math.max(calculatedCooldown, retryAfterMs(response) || 0);
+                rateLimitCooldownUntil = Math.max(rateLimitCooldownUntil, Date.now() + cooldownMs);
+                const remainingMs = Math.max(0, rateLimitCooldownUntil - Date.now());
+                console.warn(`[ChatGPT Exporter] ${label} 返回 429；暂停 ${formatWaitDuration(remainingMs)} 后自动从当前请求继续（第 ${consecutiveRateLimits} 次限流）。`);
+                onRateLimit?.({ label, waitMs: remainingMs, attempt: consecutiveRateLimits });
+            }
+        };
+        const result = apiRequestChain.then(task, task);
+        // 一个网络错误不能把后续队列永久卡死。
+        apiRequestChain = result.then(() => undefined, () => undefined);
+        return result;
+    }
+    const WINDOWS_RESERVED_FILENAMES = new Set([
+        'CON', 'PRN', 'AUX', 'NUL',
+        'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+        'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'
+    ]);
+
+    // Chrome downloads on Windows rejects control characters, trailing dots/spaces,
+    // reserved device names, and overly long path components.
+    function sanitizeFilename(name, fallback = 'Untitled Conversation', maxLength = 120) {
+        let value = String(name ?? '')
+            .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+            .replace(/[\/\\?%*:|"<>]/g, '-')
+            .replace(/\s+/g, ' ')
+            .replace(/^[. ]+|[. ]+$/g, '')
+            .trim();
+        if (!value || value === '.' || value === '..') value = fallback;
+
+        // Windows also rejects e.g. "CON.txt"; check the part before an extension.
+        const stem = value.split('.')[0].toUpperCase();
+        if (WINDOWS_RESERVED_FILENAMES.has(stem)) value = `conversation-${value}`;
+
+        value = value.slice(0, maxLength).replace(/[. ]+$/g, '').trim();
+        return value || fallback;
+    }
     const normalizeEpochSeconds = (value) => {
         if (!value) return 0;
         if (typeof value === 'number' && Number.isFinite(value)) {
@@ -114,12 +233,13 @@
 
     function generateUniqueFilename(convData) {
         const convId = convData.conversation_id || '';
-        const shortId = convId.includes('-') ? convId.split('-').pop() : (convId || Date.now().toString(36));
+        const rawShortId = convId.includes('-') ? convId.split('-').pop() : (convId || Date.now().toString(36));
+        const shortId = sanitizeFilename(rawShortId, 'conversation', 48);
         let baseName = convData.title;
         if (!baseName || baseName.trim().toLowerCase() === 'new chat') {
             baseName = 'Untitled Conversation';
         }
-        return `${sanitizeFilename(baseName)}_${shortId}.json`;
+        return `${sanitizeFilename(baseName, 'Untitled Conversation', 120)}_${shortId}.json`;
     }
 
     function generateMarkdownFilename(convData) {
@@ -129,7 +249,7 @@
             : `${jsonName}.md`;
     }
 
-    const ATTACHMENT_EXPORT_VERSION = '1.5.0';
+    const ATTACHMENT_EXPORT_VERSION = '2.0';
     const EXPORT_BUTTON_LABEL = `Export Conversations v${ATTACHMENT_EXPORT_VERSION}`;
     const MIME_EXTENSIONS = {
         'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp',
@@ -179,38 +299,6 @@
         return match ? match[0] : null;
     }
 
-    function getActiveConversationNodes(convData) {
-        const mapping = convData?.mapping;
-        if (!mapping || typeof mapping !== 'object') return [];
-
-        const entries = Object.entries(mapping);
-        if (entries.length === 0) return [];
-
-        let currentNodeId = convData?.current_node;
-        if (!currentNodeId || !mapping[currentNodeId]) {
-            const leaves = entries
-                .filter(([, node]) => !Array.isArray(node?.children) || node.children.length === 0)
-                .sort(([, a], [, b]) => {
-                    const aTime = Number(a?.message?.create_time) || 0;
-                    const bTime = Number(b?.message?.create_time) || 0;
-                    return bTime - aTime;
-                });
-            currentNodeId = leaves[0]?.[0] || entries[entries.length - 1][0];
-            console.warn('Conversation current_node is unavailable; exporting the latest leaf path instead.');
-        }
-
-        const path = [];
-        const visited = new Set();
-        while (currentNodeId && !visited.has(currentNodeId)) {
-            visited.add(currentNodeId);
-            const node = mapping[currentNodeId];
-            if (!node) break;
-            path.push(node);
-            currentNodeId = node.parent || null;
-        }
-        return path.reverse();
-    }
-
     function collectVisibleAttachments(convData) {
         const references = new Map();
         const add = (reference) => {
@@ -220,7 +308,7 @@
             if (!references.has(key)) references.set(key, reference);
         };
 
-        getActiveConversationNodes(convData).forEach(node => {
+        Object.values(convData?.mapping || {}).forEach(node => {
             const message = node?.message;
             if (!message) return;
             const role = message.author?.role;
@@ -296,7 +384,11 @@
             metadataUrl = `/backend-api/files/download/${encodeURIComponent(reference.fileId)}?inline=false`;
         }
 
-        const metadataResponse = await fetch(metadataUrl, { credentials: 'include', headers });
+        const metadataResponse = await humanApiFetch(
+            metadataUrl,
+            { credentials: 'include', headers },
+            '附件元数据'
+        );
         if (!metadataResponse.ok) throw new Error(`metadata HTTP ${metadataResponse.status}`);
         const contentType = metadataResponse.headers.get('content-type') || '';
         if (!contentType.includes('json')) {
@@ -381,14 +473,14 @@
             .trim();
     }
 
-    function processContentReferences(text, contentReferences, referenceStartIndex = 1) {
+    function processContentReferences(text, contentReferences) {
         if (!text || !Array.isArray(contentReferences) || contentReferences.length === 0) {
-            return { text, footnotes: [], nextReferenceIndex: referenceStartIndex };
+            return { text, footnotes: [] };
         }
 
         const references = contentReferences.filter(ref => ref && typeof ref.matched_text === 'string' && ref.matched_text.length > 0);
         if (references.length === 0) {
-            return { text, footnotes: [], nextReferenceIndex: referenceStartIndex };
+            return { text, footnotes: [] };
         }
 
         const getReferenceInfo = (ref) => {
@@ -419,7 +511,7 @@
             if (!info.url) return;
             const key = `${info.url}|${info.title}`;
             if (footnoteIndexByKey.has(key)) return;
-            const index = referenceStartIndex + footnotes.length;
+            const index = footnotes.length + 1;
             footnoteIndexByKey.set(key, index);
             footnotes.push({ index, url: info.url, title: info.title, label: info.label });
         });
@@ -461,64 +553,79 @@
             output = output.split(ref.matched_text).join(replacement);
         });
 
-        return {
-            text: output,
-            footnotes,
-            nextReferenceIndex: referenceStartIndex + footnotes.length
-        };
+        return { text: output, footnotes };
     }
 
     function extractConversationMessages(convData, attachmentResult = null) {
+        const mapping = convData?.mapping;
+        if (!mapping) return [];
+
         const messages = [];
-        const nodes = getActiveConversationNodes(convData);
-        let nextReferenceIndex = 1;
+        const mappingKeys = Object.keys(mapping);
+        const rootId = mapping['client-created-root']
+            ? 'client-created-root'
+            : mappingKeys.find(id => !mapping[id]?.parent) || mappingKeys[0];
+        const visited = new Set();
 
-        nodes.forEach(node => {
-            const msg = node?.message;
-            if (!msg) return;
+        const traverse = (nodeId) => {
+            if (!nodeId || visited.has(nodeId)) return;
+            visited.add(nodeId);
+            const node = mapping[nodeId];
+            if (!node) return;
 
-            const author = msg.author?.role;
-            const isHidden = msg.metadata?.is_visually_hidden_from_conversation ||
-                msg.metadata?.is_contextual_answers_system_message;
-            if ((author !== 'user' && author !== 'assistant') || isHidden) return;
-
-            const content = msg.content;
-            if ((content?.content_type !== 'text' && content?.content_type !== 'multimodal_text') || !Array.isArray(content.parts)) return;
-
-            const rawText = content.parts
-                .map(part => typeof part === 'string' ? part : (part?.text ?? ''))
-                .filter(Boolean)
-                .join('\n');
-            const contentReferences = msg.metadata?.content_references || [];
-            let processedText = rawText;
-            let footnotes = [];
-            if (Array.isArray(contentReferences) && contentReferences.length > 0) {
-                const processed = processContentReferences(rawText, contentReferences, nextReferenceIndex);
-                processedText = processed.text;
-                footnotes = processed.footnotes;
-                nextReferenceIndex = processed.nextReferenceIndex;
+            const msg = node.message;
+            if (msg) {
+                const author = msg.author?.role;
+                const isHidden = msg.metadata?.is_visually_hidden_from_conversation ||
+                    msg.metadata?.is_contextual_answers_system_message;
+                if ((author === 'user' || author === 'assistant') && !isHidden) {
+                    const content = msg.content;
+                    if ((content?.content_type === 'text' || content?.content_type === 'multimodal_text') && Array.isArray(content.parts)) {
+                        const rawText = content.parts
+                            .map(part => typeof part === 'string' ? part : (part?.text ?? ''))
+                            .filter(Boolean)
+                            .join('\n');
+                        const contentReferences = msg.metadata?.content_references || [];
+                        let processedText = rawText;
+                        let footnotes = [];
+                        if (Array.isArray(contentReferences) && contentReferences.length > 0) {
+                            const processed = processContentReferences(rawText, contentReferences);
+                            processedText = processed.text;
+                            footnotes = processed.footnotes;
+                        }
+                        const cleaned = cleanMessageContent(
+                            replaceDownloadedSandboxLinks(processedText, attachmentResult?.sandboxPaths, msg.id)
+                        );
+                        const attachmentLines = (attachmentResult?.files || [])
+                            .filter(file => file.messageId === msg.id && file.kind !== 'sandbox')
+                            .map(file => {
+                                const label = file.name.replace(/[\[\]]/g, '\\$&');
+                                return file.isImage ? `![${label}](${file.path})` : `📎 [${label}](${file.path})`;
+                            });
+                        const renderedContent = [cleaned, ...attachmentLines].filter(Boolean).join('\n\n');
+                        if (renderedContent) {
+                            messages.push({
+                                role: author,
+                                content: renderedContent,
+                                messageId: msg.id,
+                                create_time: msg.create_time || null,
+                                footnotes
+                            });
+                        }
+                    }
+                }
             }
 
-            const cleaned = cleanMessageContent(
-                replaceDownloadedSandboxLinks(processedText, attachmentResult?.sandboxPaths, msg.id)
-            );
-            const attachmentLines = (attachmentResult?.files || [])
-                .filter(file => file.messageId === msg.id && file.kind !== 'sandbox')
-                .map(file => {
-                    const label = file.name.replace(/[\[\]]/g, '\\$&');
-                    return file.isImage ? `![${label}](${file.path})` : `📎 [${label}](${file.path})`;
-                });
-            const renderedContent = [cleaned, ...attachmentLines].filter(Boolean).join('\n\n');
-            if (!renderedContent) return;
+            if (Array.isArray(node.children)) {
+                node.children.forEach(childId => traverse(childId));
+            }
+        };
 
-            messages.push({
-                role: author,
-                content: renderedContent,
-                messageId: msg.id,
-                create_time: msg.create_time || null,
-                footnotes
-            });
-        });
+        if (rootId) {
+            traverse(rootId);
+        } else {
+            mappingKeys.forEach(traverse);
+        }
 
         return messages;
     }
@@ -990,6 +1097,112 @@ html.dark #gre-fab-status {
     }
 
     async function exportConversations(options = {}) {
+        if (options.includeAttachments) {
+            return exportConversationsToZip(options);
+        }
+        return exportConversationsIndividually(options);
+    }
+
+    async function downloadConversationIndividually(convData, mode, workspaceId, conversationId) {
+        const folder = getExportFolder(mode, workspaceId);
+        const [jsonDataUrl, markdownDataUrl] = await Promise.all([
+            textToDataUrl(JSON.stringify(convData, null, 2), 'application/json'),
+            textToDataUrl(convertConversationToMarkdown(convData), 'text/markdown')
+        ]);
+        await requestExtension({
+            type: 'CHATGPT_EXPORTER_DOWNLOAD_AND_MARK',
+            scope: getExportScope(mode, workspaceId),
+            conversationId: conversationId || convData.conversation_id || convData.id,
+            files: [
+                { filename: `${folder}/${generateUniqueFilename(convData)}`, dataUrl: jsonDataUrl },
+                { filename: `${folder}/${generateMarkdownFilename(convData)}`, dataUrl: markdownDataUrl }
+            ]
+        });
+    }
+
+    async function collectFullExportEntries(btn, workspaceId, onRateLimit) {
+        const entries = [];
+        setFabStatus(btn, '📚 获取项目外对话…');
+        const orphanIds = await collectIds(btn, workspaceId, null, onRateLimit);
+        orphanIds.forEach(id => entries.push({ id }));
+
+        setFabStatus(btn, '📂 获取项目列表…');
+        const projects = await getProjects(workspaceId, { onRateLimit });
+        for (const project of projects) {
+            const projectIds = await collectIds(btn, workspaceId, project.id, onRateLimit);
+            projectIds.forEach(id => entries.push({ id, projectTitle: project.title }));
+        }
+        return entries;
+    }
+
+    async function exportConversationsIndividually(options = {}) {
+        const {
+            mode = 'personal',
+            workspaceId = null,
+            conversationEntries = null
+        } = options;
+        const btn = getExportButton();
+        btn.disabled = true;
+
+        if (!await ensureAccessToken()) {
+            btn.disabled = false;
+            setFabStatus(btn, EXPORT_BUTTON_LABEL);
+            return;
+        }
+
+        try {
+            const showRateLimitStatus = ({ label, waitMs, attempt }) => {
+                setFabStatus(btn, `⏳ 限流：暂停 ${formatWaitDuration(waitMs)} 后从当前${label}继续 (${attempt})`);
+            };
+            const entries = Array.isArray(conversationEntries) && conversationEntries.length > 0
+                ? conversationEntries
+                : await collectFullExportEntries(btn, workspaceId, showRateLimitStatus);
+            const progress = await requestExtension({
+                type: 'CHATGPT_EXPORTER_GET_COMPLETED',
+                scope: getExportScope(mode, workspaceId),
+                conversationIds: entries.map(entry => entry.id)
+            });
+            const completedIds = new Set(progress.completedIds || []);
+            const pendingEntries = entries.filter(entry => !completedIds.has(entry.id));
+
+            if (pendingEntries.length === 0) {
+                alert('所选对话均已下载，无需重复导出。可在选择窗口中清除已导出记录后重新导出。');
+                setFabStatus(btn, '✓ 已全部完成');
+                return;
+            }
+
+            for (let i = 0; i < pendingEntries.length; i++) {
+                const entry = pendingEntries[i];
+                const label = entry?.title ? entry.title.slice(0, 12) : '对话';
+                setFabStatus(btn, `📥 ${label} (${i + 1}/${pendingEntries.length})`);
+                const convData = await getConversation(entry.id, workspaceId, {
+                    onRateLimit: showRateLimitStatus
+                });
+                await downloadConversationIndividually(convData, mode, workspaceId, entry.id);
+                completedIds.add(entry.id);
+            }
+
+            alert(`✓ 已完成 ${pendingEntries.length} 条对话；已跳过 ${entries.length - pendingEntries.length} 条已下载对话。`);
+            setFabStatus(btn, '✓ 完成');
+        } catch (e) {
+            console.error('逐条导出失败:', e);
+            if (/Extension context invalidated/i.test(e?.message || '')) {
+                const shouldReload = confirm('扩展刚更新，当前 ChatGPT 页面仍在使用旧脚本。请刷新页面后再继续导出；已完成的对话会自动跳过。现在刷新页面吗？');
+                if (shouldReload) window.location.reload();
+                setFabStatus(btn, '⚠ 请刷新页面');
+                return;
+            }
+            alert(`导出已暂停: ${e.message}。已完成的对话会自动跳过，稍后重新导出即可继续。`);
+            setFabStatus(btn, '⚠ Error');
+        } finally {
+            setTimeout(() => {
+                btn.disabled = false;
+                setFabStatus(btn, EXPORT_BUTTON_LABEL);
+            }, 3000);
+        }
+    }
+
+    async function exportConversationsToZip(options = {}) {
         const {
             mode = 'personal',
             workspaceId = null,
@@ -1204,7 +1417,12 @@ html.dark #gre-fab-status {
                 query.set('cursor', cursor);
             }
 
-            const r = await fetch(`/backend-api/gizmos/snorlax/sidebar?${query.toString()}`, { headers });
+            const r = await humanApiFetch(
+                `/backend-api/gizmos/snorlax/sidebar?${query.toString()}`,
+                { headers },
+                '项目空间列表',
+                options.onRateLimit
+            );
             if (!r.ok) {
                 throw new Error(`获取项目空间列表失败 (${r.status})`);
             }
@@ -1224,10 +1442,10 @@ html.dark #gre-fab-status {
         return Array.from(projects.values());
     }
 
-    async function getProjects(workspaceId) {
+    async function getProjects(workspaceId, options = {}) {
         if (!workspaceId) return [];
         try {
-            const projects = await getProjectSpaces(workspaceId);
+            const projects = await getProjectSpaces(workspaceId, options);
             return projects.map(({ id, title }) => ({ id, title }));
         } catch (err) {
             console.warn(`获取项目(Gizmo)列表失败 (${err?.message || err})`);
@@ -1235,7 +1453,7 @@ html.dark #gre-fab-status {
         }
     }
 
-    async function collectIds(btn, workspaceId, gizmoId) {
+    async function collectIds(btn, workspaceId, gizmoId, onRateLimit = null) {
         const all = new Set();
         const deviceId = getOaiDeviceId();
         if (!deviceId) {
@@ -1250,8 +1468,15 @@ html.dark #gre-fab-status {
         if (gizmoId) {
             let cursor = '0';
             do {
-                const r = await fetch(`/backend-api/gizmos/${gizmoId}/conversations?cursor=${cursor}`, { headers });
-                if (!r.ok) throw new Error(`列举项目对话列表失败 (${r.status})`);
+                const r = await humanApiFetch(
+                    `/backend-api/gizmos/${gizmoId}/conversations?cursor=${cursor}`,
+                    { headers },
+                    '项目对话列表',
+                    onRateLimit
+                );
+                if (!r.ok) {
+                    throw new Error(`列举项目对话列表失败 (${r.status})`);
+                }
                 const j = await r.json();
                 j.items?.forEach(it => all.add(it.id));
                 cursor = j.cursor;
@@ -1262,8 +1487,15 @@ html.dark #gre-fab-status {
                 let offset = 0, has_more = true, page = 0;
                 do {
                     setFabStatus(btn, `📂 项目外对话 (${is_archived ? 'Archived' : 'Active'} p${++page})`);
-                    const r = await fetch(`/backend-api/conversations?offset=${offset}&limit=${PAGE_LIMIT}&order=updated${is_archived ? '&is_archived=true' : ''}`, { headers });
-                    if (!r.ok) throw new Error(`列举项目外对话列表失败 (${r.status})`);
+                    const r = await humanApiFetch(
+                        `/backend-api/conversations?offset=${offset}&limit=${PAGE_LIMIT}&order=updated${is_archived ? '&is_archived=true' : ''}`,
+                        { headers },
+                        '项目外对话列表',
+                        onRateLimit
+                    );
+                    if (!r.ok) {
+                        throw new Error(`列举项目外对话列表失败 (${r.status})`);
+                    }
                     const j = await r.json();
                     if (j.items && j.items.length > 0) {
                         j.items.forEach(it => all.add(it.id));
@@ -1313,7 +1545,7 @@ html.dark #gre-fab-status {
         }
     }
 
-    async function listConversations(workspaceId) {
+    async function listConversations(workspaceId, options = {}) {
         if (!await ensureAccessToken()) {
             throw new Error('无法获取 Access Token，请刷新页面或打开任意一个对话后再试。');
         }
@@ -1331,12 +1563,23 @@ html.dark #gre-fab-status {
 
         const map = new Map();
         const addEntry = (item, extra = {}) => upsertConversationEntry(map, item, extra);
+        const publish = (message) => {
+            options.onUpdate?.(
+                Array.from(map.values()).sort((a, b) => (b.update_time || 0) - (a.update_time || 0)),
+                message
+            );
+        };
 
         for (const is_archived of [false, true]) {
             let offset = 0;
             let has_more = true;
             do {
-                const r = await fetch(`/backend-api/conversations?offset=${offset}&limit=${PAGE_LIMIT}&order=updated${is_archived ? '&is_archived=true' : ''}`, { headers });
+                    const r = await humanApiFetch(
+                        `/backend-api/conversations?offset=${offset}&limit=${PAGE_LIMIT}&order=updated${is_archived ? '&is_archived=true' : ''}`,
+                        { headers },
+                        '对话列表',
+                        options.onRateLimit
+                    );
                 if (!r.ok) throw new Error(`列举对话列表失败 (${r.status})`);
                 const j = await r.json();
                 if (j.items && j.items.length > 0) {
@@ -1346,20 +1589,27 @@ html.dark #gre-fab-status {
                 } else {
                     has_more = false;
                 }
+                publish(`已读取 ${map.size} 条${is_archived ? '归档' : '活跃'}对话，继续加载其余列表…`);
                 await sleep(jitter());
             } while (has_more);
         }
 
         if (workspaceId) {
-            const projects = await getProjects(workspaceId);
+            const projects = await getProjects(workspaceId, { onRateLimit: options.onRateLimit });
             for (const project of projects) {
                 let cursor = '0';
                 do {
-                    const r = await fetch(`/backend-api/gizmos/${project.id}/conversations?cursor=${cursor}`, { headers });
+                    const r = await humanApiFetch(
+                        `/backend-api/gizmos/${project.id}/conversations?cursor=${cursor}`,
+                        { headers },
+                        '项目对话列表',
+                        options.onRateLimit
+                    );
                     if (!r.ok) throw new Error(`列举项目对话列表失败 (${r.status})`);
                     const j = await r.json();
                     j.items?.forEach(it => addEntry(it, { projectId: project.id, projectTitle: project.title }));
                     cursor = j.cursor;
+                    publish(`已读取 ${map.size} 条对话，正在加载项目“${project.title}”…`);
                     await sleep(jitter());
                 } while (cursor);
             }
@@ -1369,7 +1619,7 @@ html.dark #gre-fab-status {
             .sort((a, b) => (b.update_time || 0) - (a.update_time || 0));
     }
 
-    async function listProjectSpaceConversations(workspaceId) {
+    async function listProjectSpaceConversations(workspaceId, options = {}) {
         if (!await ensureAccessToken()) {
             throw new Error('无法获取 Access Token，请刷新页面或打开任意一个对话后再试。');
         }
@@ -1387,13 +1637,28 @@ html.dark #gre-fab-status {
         if (resolvedWorkspaceId) { headers['ChatGPT-Account-Id'] = resolvedWorkspaceId; }
 
         const map = new Map();
-        const projects = await getProjectSpaces(resolvedWorkspaceId, { conversationsPerGizmo: PROJECT_SIDEBAR_PREVIEW, ownedOnly: true });
+        const publish = (message) => {
+            options.onUpdate?.(
+                Array.from(map.values()).sort((a, b) => (b.update_time || 0) - (a.update_time || 0)),
+                message
+            );
+        };
+        const projects = await getProjectSpaces(resolvedWorkspaceId, {
+            conversationsPerGizmo: PROJECT_SIDEBAR_PREVIEW,
+            ownedOnly: true,
+            onRateLimit: options.onRateLimit
+        });
 
         for (const project of projects) {
             let cursor = '0';
             let fetched = false;
             do {
-                const r = await fetch(`/backend-api/gizmos/${project.id}/conversations?cursor=${cursor}`, { headers });
+                const r = await humanApiFetch(
+                    `/backend-api/gizmos/${project.id}/conversations?cursor=${cursor}`,
+                    { headers },
+                    '项目空间对话列表',
+                    options.onRateLimit
+                );
                 if (!r.ok) {
                     if (!fetched && Array.isArray(project.conversations) && project.conversations.length > 0) {
                         console.warn(`项目空间对话列表请求失败 (${r.status})，使用侧边栏返回的预览对话。`);
@@ -1402,6 +1667,7 @@ html.dark #gre-fab-status {
                             projectTitle: project.title
                         }));
                         cursor = null;
+                        publish(`已读取 ${map.size} 条对话，继续加载其余项目…`);
                         break;
                     }
                     throw new Error(`列举项目空间对话列表失败 (${r.status})`);
@@ -1413,6 +1679,7 @@ html.dark #gre-fab-status {
                 }));
                 cursor = j.cursor;
                 fetched = true;
+                publish(`已读取 ${map.size} 条对话，正在加载项目“${project.title}”…`);
                 await sleep(jitter());
             } while (cursor);
         }
@@ -1421,7 +1688,7 @@ html.dark #gre-fab-status {
             .sort((a, b) => (b.update_time || 0) - (a.update_time || 0));
     }
 
-    async function getConversation(id, workspaceId) {
+    async function getConversation(id, workspaceId, options = {}) {
         const deviceId = getOaiDeviceId();
         if (!deviceId) {
             throw new Error('无法获取 oai-device-id，请确保已登录并刷新页面。');
@@ -1432,11 +1699,13 @@ html.dark #gre-fab-status {
         };
         const resolvedWorkspaceId = resolveWorkspaceId(workspaceId);
         if (resolvedWorkspaceId) { headers['ChatGPT-Account-Id'] = resolvedWorkspaceId; }
-        const r = await fetch(`/backend-api/conversation/${id}`, { headers });
+        const r = await humanApiFetch(
+            `/backend-api/conversation/${id}`,
+            { headers },
+            '对话详情',
+            options.onRateLimit
+        );
         if (!r.ok) {
-            if (r.status === 429) {
-                throw new Error(`获取对话详情失败 conv ${id}：官方接口限流 (429)。请降低导出频率、减少单次导出的对话数量，等待几分钟后再试。`);
-            }
             throw new Error(`获取对话详情失败 conv ${id} (${r.status})`);
         }
         const j = await r.json();
@@ -1508,7 +1777,11 @@ html.dark #gre-fab-status {
             fontFamily: 'sans-serif', color: '#333', boxSizing: 'border-box'
         });
 
-        const closeDialog = () => document.body.removeChild(overlay);
+        let pickerClosed = false;
+        const closeDialog = () => {
+            pickerClosed = true;
+            if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+        };
         const state = {
             list: [],
             filtered: [],
@@ -1519,11 +1792,16 @@ html.dark #gre-fab-status {
             archived: 'all',
             timeField: 'update',
             loading: true,
+            loadingMore: true,
+            loadingMessage: '正在获取第一批对话…',
+            loadError: '',
             pageSize: 100,
             visibleCount: 100,
             startDate: '',
             endDate: '',
-            includeAttachments: Boolean(includeAttachments)
+            includeAttachments: Boolean(includeAttachments),
+            exportScope: getExportScope(mode, workspaceId),
+            completedIds: new Set()
         };
 
         const renderBase = () => {
@@ -1584,9 +1862,28 @@ html.dark #gre-fab-status {
             const startDateInput = dialog.querySelector('#filter-start-date');
             const endDateInput = dialog.querySelector('#filter-end-date');
             const includeAttachmentsInput = dialog.querySelector('#include-attachments-picker');
+            if (includeAttachmentsInput?.parentElement) {
+                const attachmentModeNote = document.createElement('div');
+                attachmentModeNote.textContent = '\u5f00\u542f\u9644\u4ef6\u65f6\u4f7f\u7528\u517c\u5bb9 ZIP \u5bfc\u51fa\uff0c\u4e0d\u652f\u6301\u9010\u6761\u7eed\u4f20\u3002';
+                Object.assign(attachmentModeNote.style, {
+                    width: '100%', marginTop: '4px', color: '#92400e', fontSize: '12px'
+                });
+                includeAttachmentsInput.parentElement.appendChild(attachmentModeNote);
+            }
             const clearDateBtn = dialog.querySelector('#clear-date-btn');
             const selectAllBtn = dialog.querySelector('#select-all-btn');
             const clearAllBtn = dialog.querySelector('#clear-all-btn');
+            let clearProgressBtn = dialog.querySelector('#clear-progress-btn');
+            if (!clearProgressBtn && clearAllBtn) {
+                clearProgressBtn = document.createElement('button');
+                clearProgressBtn.id = 'clear-progress-btn';
+                clearProgressBtn.textContent = '\u6e05\u9664\u5df2\u5bfc\u51fa\u8bb0\u5f55';
+                Object.assign(clearProgressBtn.style, {
+                    padding: '8px 12px', border: '1px solid #f59e0b', borderRadius: '6px',
+                    background: '#fffbeb', color: '#92400e', cursor: 'pointer'
+                });
+                clearAllBtn.insertAdjacentElement('afterend', clearProgressBtn);
+            }
             const backBtn = dialog.querySelector('#back-btn');
             const exportBtn = dialog.querySelector('#export-selected-btn');
 
@@ -1638,6 +1935,7 @@ html.dark #gre-fab-status {
             };
             includeAttachmentsInput.onchange = (e) => {
                 state.includeAttachments = e.target.checked;
+                renderList();
             };
             selectAllBtn.onclick = () => {
                 state.filtered.forEach(item => state.selected.add(item.id));
@@ -1646,6 +1944,16 @@ html.dark #gre-fab-status {
             clearAllBtn.onclick = () => {
                 state.selected.clear();
                 renderList();
+            };
+            if (clearProgressBtn) clearProgressBtn.onclick = async () => {
+                if (!confirm('\u6e05\u9664\u5f53\u524d\u7a7a\u95f4\u7684\u5df2\u5bfc\u51fa\u8bb0\u5f55\uff1f\u4e4b\u540e\u53ef\u91cd\u65b0\u4e0b\u8f7d\u6b64\u524d\u8df3\u8fc7\u7684\u5bf9\u8bdd\u3002')) return;
+                try {
+                    await requestExtension({ type: 'CHATGPT_EXPORTER_CLEAR_COMPLETED', scope: state.exportScope });
+                    state.completedIds.clear();
+                    renderList();
+                } catch (error) {
+                    alert(`\u6e05\u9664\u5df2\u5bfc\u51fa\u8bb0\u5f55\u5931\u8d25: ${error.message}`);
+                }
             };
             backBtn.onclick = () => {
                 closeDialog();
@@ -1690,21 +1998,32 @@ html.dark #gre-fab-status {
             const exportBtn = dialog.querySelector('#export-selected-btn');
             const selectAllBtn = dialog.querySelector('#select-all-btn');
             const clearAllBtn = dialog.querySelector('#clear-all-btn');
-            const controlsDisabled = state.loading;
+            const controlsDisabled = state.loading && state.list.length === 0;
 
             if (selectAllBtn) selectAllBtn.disabled = controlsDisabled;
             if (clearAllBtn) clearAllBtn.disabled = controlsDisabled;
             if (exportBtn) exportBtn.disabled = controlsDisabled || state.selected.size === 0;
 
             listEl.innerHTML = '';
-            if (state.loading) {
-                statusEl.textContent = '正在加载列表...';
+            if (state.loading && state.list.length === 0) {
+                statusEl.textContent = state.loadingMessage || '正在获取第一批对话…';
                 return;
             }
 
             const visibleCount = Math.min(state.visibleCount, state.filtered.length);
+            const completedInScope = state.filtered.filter(item => state.completedIds.has(item.id)).length;
             statusEl.textContent = `共 ${state.list.length} 条，当前筛选 ${state.filtered.length} 条，显示 ${visibleCount} 条，已选 ${state.selected.size} 条`;
+            if (state.loadingMore) {
+                statusEl.textContent += ` · ${state.loadingMessage || '正在后台加载其余列表…'}`;
+            }
+            if (state.loadError) {
+                statusEl.textContent += ` · 列表加载未完成：${state.loadError}`;
+            }
             exportBtn.textContent = `导出选中 (${state.selected.size})`;
+
+            if (!state.includeAttachments && completedInScope > 0) {
+                statusEl.textContent += ` · \u5df2\u5bfc\u51fa ${completedInScope}`;
+            }
 
             if (state.filtered.length === 0) {
                 const empty = document.createElement('div');
@@ -1723,6 +2042,10 @@ html.dark #gre-fab-status {
                     border: '1px solid #e5e7eb', borderRadius: '6px',
                     marginBottom: '8px', cursor: 'pointer', alignItems: 'flex-start'
                 });
+                if (!state.includeAttachments && state.completedIds.has(item.id)) {
+                    label.style.opacity = '0.55';
+                    label.title = '\u5df2\u5bfc\u51fa\uff0c\u672c\u6b21\u5c06\u81ea\u52a8\u8df3\u8fc7\u3002';
+                }
 
                 const checkbox = document.createElement('input');
                 checkbox.type = 'checkbox';
@@ -1807,22 +2130,52 @@ html.dark #gre-fab-status {
         document.body.appendChild(overlay);
         overlay.onclick = (e) => { if (e.target === overlay) closeDialog(); };
 
+        const updatePickerList = (list, message) => {
+            if (pickerClosed) return;
+            state.list = list;
+            state.loading = false;
+            state.loadingMore = true;
+            state.loadingMessage = message || '正在后台加载其余列表…';
+            applyFilters();
+            renderList();
+        };
+        const updatePickerRateLimit = ({ label, waitMs }) => {
+            if (pickerClosed) return;
+            state.loadingMessage = `${label} 被限流，等待 ${formatWaitDuration(waitMs)} 后自动继续…`;
+            renderList();
+        };
+        const listOptions = { onUpdate: updatePickerList, onRateLimit: updatePickerRateLimit };
         const listPromise = mode === 'project'
-            ? listProjectSpaceConversations(workspaceId)
-            : listConversations(workspaceId);
+            ? listProjectSpaceConversations(workspaceId, listOptions)
+            : listConversations(workspaceId, listOptions);
         listPromise
-            .then(list => {
+            .then(async list => {
+                if (pickerClosed) return;
                 state.list = list;
+                state.loading = false;
+                state.loadingMore = false;
+                state.loadingMessage = '列表已全部加载';
+                if (!state.includeAttachments) {
+                    try {
+                        const progress = await requestExtension({
+                            type: 'CHATGPT_EXPORTER_GET_COMPLETED',
+                            scope: state.exportScope,
+                            conversationIds: list.map(item => item.id)
+                        });
+                        state.completedIds = new Set(progress.completedIds || []);
+                    } catch (error) {
+                        console.warn('[ChatGPT Exporter] failed to load export history', error);
+                    }
+                }
                 state.loading = false;
                 applyFilters();
                 renderList();
             })
             .catch(err => {
-                const statusEl = dialog.querySelector('#conv-status');
+                if (pickerClosed) return;
                 state.loading = false;
-                state.list = [];
-                state.filtered = [];
-                statusEl.textContent = `加载失败: ${err.message}`;
+                state.loadingMore = false;
+                state.loadError = err.message;
                 renderList();
             });
     }
@@ -2049,6 +2402,7 @@ html.dark #gre-fab-status {
             }
             return startExportProcess(mode, workspaceId);
         },
+        resumeExport: (options = {}) => exportConversations(options),
         startScheduledExport
     });
 
@@ -2075,6 +2429,9 @@ html.dark #gre-fab-status {
                     break;
                 case 'START_MANUAL_EXPORT':
                     api.startManualExport(data.payload?.mode, data.payload?.workspaceId);
+                    break;
+                case 'RESUME_EXPORT':
+                    api.resumeExport(data.payload || {});
                     break;
                 default:
                     console.warn('[ChatGPT Exporter] 未知命令:', data.action);

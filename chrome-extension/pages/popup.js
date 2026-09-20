@@ -1,7 +1,7 @@
 import { normalizeSettings, calculateNextTrigger } from '../utils/schedule.js';
 import { storage, tabs } from '../utils/chrome-helpers.js';
 
-const EXPECTED_EXPORTER_VERSION = '1.5.0';
+const EXPECTED_EXPORTER_VERSION = '2.0';
 
 const nextRunEl = document.getElementById('next-run');
 const reminderNoteEl = document.getElementById('reminder-note');
@@ -76,4 +76,3 @@ async function getActiveChatGPTTab() {
     }
     return null;
 }
-

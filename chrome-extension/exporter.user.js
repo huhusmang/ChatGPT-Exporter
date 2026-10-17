@@ -1162,26 +1162,30 @@ html.dark #gre-fab-status {
         else if (!clean) title = '导出完成，部分内容失败';
         return { tone: clean ? 'ok' : zipCreated ? 'warn' : 'error', title, message: lines.join('\n') };
     }
-    // --- 增量导出记录：按账户记住每个对话上次导出时的更新时间 ---
+    // --- 增量导出记录：按账户记住每个对话上次导出时的更新时间，以及最近一次导出的时间 ---
     const EXPORT_HISTORY_KEY = 'chatgpt-exporter-history-v1';
 
     function exportHistoryStorageKey(accountId) {
         return `${EXPORT_HISTORY_KEY}:${accountId || 'default'}`;
     }
 
+    // 早期版本直接存 { 对话 ID: 更新时间 }，读取时兼容这种格式。
     function loadExportHistory(accountId) {
         try {
             const saved = JSON.parse(localStorage.getItem(exportHistoryStorageKey(accountId)));
-            return saved && typeof saved === 'object' ? saved : {};
-        } catch (_) {
-            return {};
-        }
+            if (saved && typeof saved.items === 'object' && saved.items) {
+                return { items: saved.items, lastExportAt: Number(saved.lastExportAt) || null };
+            }
+            if (saved && typeof saved === 'object') return { items: saved, lastExportAt: null };
+        } catch (_) {}
+        return { items: {}, lastExportAt: null };
     }
 
     function saveExportHistory(accountId, history, exported) {
         exported.forEach(({ id, updateTime }) => {
-            if (id && updateTime) history[id] = Math.max(updateTime, Number(history[id]) || 0);
+            if (id && updateTime) history.items[id] = Math.max(updateTime, Number(history.items[id]) || 0);
         });
+        history.lastExportAt = Date.now();
         try {
             localStorage.setItem(exportHistoryStorageKey(accountId), JSON.stringify(history));
         } catch (error) {
@@ -1189,18 +1193,37 @@ html.dark #gre-fab-status {
         }
     }
 
-    function clearExportHistory() {
+    function clearExportHistory(accountId) {
         try {
-            Object.keys(localStorage)
-                .filter(key => key.startsWith(`${EXPORT_HISTORY_KEY}:`))
-                .forEach(key => localStorage.removeItem(key));
+            localStorage.removeItem(exportHistoryStorageKey(accountId));
         } catch (_) {}
     }
 
+    // 'new'：从未导出；'updated'：导出后又有更新；'exported'：导出后没有变化。
+    function exportStatusOf(entry, items) {
+        const exportedAt = Number(items[entry.id]) || 0;
+        if (!exportedAt) return 'new';
+        const updatedAt = normalizeEpochSeconds(entry.update_time) || 0;
+        return updatedAt > exportedAt ? 'updated' : 'exported';
+    }
+
     function isUnchangedSinceLastExport(entry, history) {
-        const exportedAt = Number(history[entry.id]) || 0;
-        const updatedAt = Number(entry.update_time) || 0;
-        return exportedAt > 0 && updatedAt > 0 && exportedAt >= updatedAt;
+        return exportStatusOf(entry, history.items) === 'exported' && Boolean(normalizeEpochSeconds(entry.update_time));
+    }
+
+    function formatShortDateTime(ms) {
+        const date = new Date(ms);
+        const pad = value => String(value).padStart(2, '0');
+        const sameYear = date.getFullYear() === new Date().getFullYear();
+        const day = sameYear ? `${date.getMonth() + 1}/${date.getDate()}` : `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()}`;
+        return `${day} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    }
+
+    function describeExportHistory(history) {
+        const count = Object.keys(history.items).length;
+        if (count === 0) return '还没有导出记录，这次会导出全部对话';
+        const last = history.lastExportAt ? ` · 上次导出 ${formatShortDateTime(history.lastExportAt)}` : '';
+        return `已记录 ${count.toLocaleString()} 个对话${last}`;
     }
 
     function localDateStamp(date = new Date()) {
@@ -1755,7 +1778,7 @@ html.dark .gre-seg button[aria-checked="true"] { background: var(--gre-elev); }
 .gre-field .gre-chip { width: 100%; min-width: 0; justify-content: space-between; }
 .gre-field .gre-chip > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .gre-dialog:focus { outline: none; }
-.gre-history { padding: 0 0 8px; }
+.gre-history { display: flex; align-items: baseline; gap: 10px; margin-top: -4px; padding: 0 0 8px; }
 
 .gre-btn {
     display: inline-flex; align-items: center; justify-content: center; height: 36px; padding: 0 16px;
@@ -2078,6 +2101,7 @@ html.dark .gre-seg button[aria-checked="true"] { background: var(--gre-elev); }
             scope: 'all',
             archived: 'all',
             timeRange: 'all',
+            exportStatus: 'all',
             startDate: '',
             endDate: '',
             pageSize: 100,
@@ -2085,6 +2109,9 @@ html.dark .gre-seg button[aria-checked="true"] { background: var(--gre-elev); }
             includeAttachments: Boolean(includeAttachments)
         };
         const timeField = () => (state.sort.startsWith('create') ? 'create_time' : 'update_time');
+        const history = loadExportHistory(resolveWorkspaceId(workspaceId));
+        const hasHistory = Object.keys(history.items).length > 0;
+        const STATUS_LABELS = { new: '未导出', updated: '有更新' };
 
         // 关闭选择器时停止仍在进行的列表加载，避免关闭后继续请求接口。
         const listSession = createTaskSession(text => {
@@ -2206,6 +2233,19 @@ html.dark .gre-seg button[aria-checked="true"] { background: var(--gre-elev); }
             onChange: value => { state.archived = value; refilter(); }
         }).el);
         filtersEl.appendChild(timeDropdown.el);
+        if (hasHistory) {
+            filtersEl.appendChild(createDropdown({
+                id: 'filter-export-status',
+                label: '导出状态',
+                value: 'all',
+                options: [
+                    { value: 'all', label: '全部' },
+                    { value: 'changed', label: '有变化' },
+                    { value: 'exported', label: '已导出' }
+                ],
+                onChange: value => { state.exportStatus = value; refilter(); }
+            }).el);
+        }
 
         $('#gre-close-btn').onclick = requestClose;
         $('#conv-search').oninput = e => { state.query = e.target.value || ''; refilter(); };
@@ -2261,6 +2301,10 @@ html.dark .gre-seg button[aria-checked="true"] { background: var(--gre-elev); }
                 if (state.scope === 'root' && item.projectTitle) return false;
                 if (state.archived === 'active' && item.is_archived) return false;
                 if (state.archived === 'archived' && !item.is_archived) return false;
+                if (state.exportStatus !== 'all') {
+                    const exported = exportStatusOf(item, history.items) === 'exported';
+                    if ((state.exportStatus === 'exported') !== exported) return false;
+                }
                 if (startBound || endBound) {
                     const ts = normalizeEpochSeconds(item[field] || 0);
                     if (!ts) return false;
@@ -2332,7 +2376,8 @@ html.dark .gre-seg button[aria-checked="true"] { background: var(--gre-elev); }
                 toggleItem(index, e.shiftKey);
             });
 
-            const meta = [item.projectTitle, item.is_archived ? '已归档' : null].filter(Boolean).join(' · ');
+            const status = hasHistory ? STATUS_LABELS[exportStatusOf(item, history.items)] : null;
+            const meta = [status, item.projectTitle, item.is_archived ? '已归档' : null].filter(Boolean).join(' · ');
             const timeValue = item[timeField()];
             row.innerHTML = `
                 <span class="gre-box">${ICONS.check}<i></i></span>
@@ -2434,7 +2479,8 @@ html.dark .gre-seg button[aria-checked="true"] { background: var(--gre-elev); }
                     ${toggleHtml('incremental-export', '仅导出有变化的对话', incremental)}
                 </div>
                 <div id="gre-history-row" class="gre-history" hidden>
-                    <button type="button" id="clear-history-btn" class="gre-link">清除导出记录</button>
+                    <span id="gre-history-text" class="gre-count"></span>
+                    <button type="button" id="clear-history-btn" class="gre-link">清除</button>
                 </div>
             </div>
             <div class="gre-foot">
@@ -2463,7 +2509,7 @@ html.dark .gre-seg button[aria-checked="true"] { background: var(--gre-elev); }
                     value: detectedIds[0],
                     options: detectedIds.map(id => ({ value: id, label: id })),
                     renderValue: option => `<span class="gre-mono">${escapeHtml(option.label)}</span>`,
-                    onChange: () => {}
+                    onChange: renderHistory
                 });
                 row.appendChild(teamDropdown.el);
             } else {
@@ -2476,12 +2522,29 @@ html.dark .gre-seg button[aria-checked="true"] { background: var(--gre-elev); }
             }
         };
 
+        // 增量记录按账户保存：团队空间看所选工作区，个人和项目空间看当前账户。
+        const currentAccountId = () => (space === 'team'
+            ? (teamDropdown ? teamDropdown.value : null)
+            : resolveWorkspaceId(null));
+        function renderHistory() {
+            historyRow.hidden = !incremental;
+            if (!incremental) return;
+            const canResolve = space !== 'team' || teamDropdown;
+            const history = canResolve ? loadExportHistory(currentAccountId()) : { items: {}, lastExportAt: null };
+            $('#gre-history-text').textContent = canResolve ? describeExportHistory(history) : '填写工作区 ID 后按该工作区的记录判断';
+            const clearBtn = $('#clear-history-btn');
+            clearBtn.hidden = Object.keys(history.items).length === 0;
+            clearBtn.disabled = false;
+            clearBtn.textContent = '清除';
+        }
+
         const selectSpace = value => {
             space = value;
             dialog.querySelectorAll('[data-space]').forEach(button => {
                 button.setAttribute('aria-checked', String(button.dataset.space === space));
             });
             renderTeamField();
+            renderHistory();
         };
 
         const readWorkspaceId = () => {
@@ -2501,14 +2564,12 @@ html.dark .gre-seg button[aria-checked="true"] { background: var(--gre-elev); }
         bindToggle($('#include-attachments'), value => { includeAttachments = value; });
         bindToggle($('#incremental-export'), value => {
             incremental = value;
-            historyRow.hidden = !value;
+            renderHistory();
         });
-        historyRow.hidden = !incremental;
-        $('#clear-history-btn').onclick = e => {
-            if (!confirm('清除后，下一次增量导出会重新导出全部对话。确定清除吗？')) return;
-            clearExportHistory();
-            e.target.textContent = '导出记录已清除';
-            e.target.disabled = true;
+        $('#clear-history-btn').onclick = () => {
+            if (!confirm('清除后，下一次增量导出会重新导出这个空间的全部对话。确定清除吗？')) return;
+            clearExportHistory(currentAccountId());
+            renderHistory();
         };
         $('#gre-close-btn').onclick = closeDialog;
         $('#export-all-btn').onclick = () => {

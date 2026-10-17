@@ -129,7 +129,7 @@
             : `${jsonName}.md`;
     }
 
-    const ATTACHMENT_EXPORT_VERSION = '1.5.0';
+    const ATTACHMENT_EXPORT_VERSION = '1.5.1';
     const EXPORT_BUTTON_LABEL = `Export Conversations v${ATTACHMENT_EXPORT_VERSION}`;
     const MIME_EXTENSIONS = {
         'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp',
@@ -969,24 +969,102 @@ html.dark #gre-fab-status {
 
     // --- 导出流程核心逻辑 ---
 
-    async function addConversationToZip(target, convData, workspaceId, report = null) {
+    // JSON 是无损备份，必须最先写入；附件或 Markdown 出错只降级为部分成功，不影响已写入的 JSON。
+    async function addConversationToZip(target, convData, workspaceId, attachmentReport = null) {
         target.file(generateUniqueFilename(convData), JSON.stringify(convData, null, 2));
-        if (!report) {
-            target.file(generateMarkdownFilename(convData), convertConversationToMarkdown(convData));
-            return;
+        const stageErrors = [];
+        let attachmentResult = null;
+        if (attachmentReport) {
+            try {
+                attachmentResult = await appendAttachmentsToZip(target, convData, workspaceId);
+                attachmentReport.detected += attachmentResult.detected;
+                attachmentReport.downloaded += attachmentResult.files.length;
+                attachmentReport.failed += attachmentResult.failures.length;
+                attachmentReport.conversations.push({
+                    conversation_id: convData?.conversation_id || null,
+                    title: convData?.title || 'Untitled Conversation',
+                    detected: attachmentResult.detected,
+                    downloaded: attachmentResult.files,
+                    failures: attachmentResult.failures
+                });
+            } catch (error) {
+                attachmentResult = null;
+                stageErrors.push({ stage: 'attachments', error });
+            }
         }
-        const attachmentResult = await appendAttachmentsToZip(target, convData, workspaceId);
-        target.file(generateMarkdownFilename(convData), convertConversationToMarkdown(convData, attachmentResult));
-        report.detected += attachmentResult.detected;
-        report.downloaded += attachmentResult.files.length;
-        report.failed += attachmentResult.failures.length;
-        report.conversations.push({
-            conversation_id: convData?.conversation_id || null,
-            title: convData?.title || 'Untitled Conversation',
-            detected: attachmentResult.detected,
-            downloaded: attachmentResult.files,
-            failures: attachmentResult.failures
+        try {
+            target.file(generateMarkdownFilename(convData), convertConversationToMarkdown(convData, attachmentResult));
+        } catch (error) {
+            stageErrors.push({ stage: 'markdown', error });
+        }
+        return stageErrors;
+    }
+
+    function createExportErrorReport() {
+        return {
+            exporter_version: ATTACHMENT_EXPORT_VERSION,
+            generated_at: new Date().toISOString(),
+            succeeded: 0,
+            partial: 0,
+            failed: 0,
+            stopped_reason: null,
+            issues: []
+        };
+    }
+
+    function recordExportIssue(errorReport, entry, stage, error) {
+        const message = error?.message || String(error);
+        errorReport.issues.push({
+            conversation_id: entry?.id || null,
+            title: entry?.title || null,
+            folder: entry?.folder || null,
+            stage,
+            error: message
         });
+        console.error(`[ChatGPT Exporter] ${stage} 阶段失败 (${entry?.id || entry?.folder || 'unknown'}):`, error);
+    }
+
+    // 返回 'ok' | 'partial' | 'failed' | 'stopped'；只有 'stopped' 需要调用方终止批量导出。
+    async function exportConversationSafely(target, entry, workspaceId, attachmentReport, errorReport) {
+        let convData;
+        try {
+            convData = await getConversation(entry.id, workspaceId);
+        } catch (error) {
+            errorReport.failed += 1;
+            recordExportIssue(errorReport, entry, 'fetch', error);
+            if (error?.stopsBatch) {
+                errorReport.stopped_reason = error.message;
+                return 'stopped';
+            }
+            return 'failed';
+        }
+
+        const issueEntry = { ...entry, title: convData?.title || entry.title };
+        let stageErrors;
+        try {
+            stageErrors = await addConversationToZip(target, convData, workspaceId, attachmentReport);
+        } catch (error) {
+            errorReport.failed += 1;
+            recordExportIssue(errorReport, issueEntry, 'json', error);
+            return 'failed';
+        }
+        if (stageErrors.length === 0) {
+            errorReport.succeeded += 1;
+            return 'ok';
+        }
+        errorReport.partial += 1;
+        stageErrors.forEach(({ stage, error }) => recordExportIssue(errorReport, issueEntry, stage, error));
+        return 'partial';
+    }
+
+    function buildExportSummary(errorReport) {
+        if (errorReport.issues.length === 0) return '✅ 导出完成！';
+        const head = errorReport.stopped_reason
+            ? `⚠️ 导出已提前停止，ZIP 中只包含停止前导出的对话。\n原因：${errorReport.stopped_reason}`
+            : '⚠️ 导出完成，但有部分内容失败。';
+        const listFailures = errorReport.issues.filter(issue => issue.stage === 'list').length;
+        const listLine = listFailures > 0 ? `\n另有 ${listFailures} 个项目的对话列表获取失败。` : '';
+        return `${head}\n成功 ${errorReport.succeeded}，部分成功（已存 JSON，缺 Markdown 或附件）${errorReport.partial}，失败 ${errorReport.failed}。${listLine}\n详情见 ZIP 内的 export-error-report.json。`;
     }
 
     async function exportConversations(options = {}) {
@@ -1016,47 +1094,68 @@ html.dark #gre-fab-status {
                 failed: 0,
                 conversations: []
             } : null;
+            const errorReport = createExportErrorReport();
+            let stopped = false;
+            const exportOne = async (target, entry) => {
+                const outcome = await exportConversationSafely(target, entry, workspaceId, attachmentReport, errorReport);
+                if (outcome === 'stopped') {
+                    stopped = true;
+                    return;
+                }
+                await sleep(jitter());
+            };
+
             if (Array.isArray(conversationEntries) && conversationEntries.length > 0) {
-                for (let i = 0; i < conversationEntries.length; i++) {
+                for (let i = 0; i < conversationEntries.length && !stopped; i++) {
                     const entry = conversationEntries[i];
                     const label = entry?.title ? entry.title.slice(0, 12) : '对话';
                     setFabStatus(btn, `📥 ${label} (${i + 1}/${conversationEntries.length})`);
-                    const convData = await getConversation(entry.id, workspaceId);
                     const target = entry?.projectTitle
                         ? zip.folder(sanitizeFilename(entry.projectTitle))
                         : zip;
-                    await addConversationToZip(target, convData, workspaceId, attachmentReport);
-                    await sleep(jitter());
+                    await exportOne(target, { id: entry.id, title: entry?.title || null, folder: entry?.projectTitle || null });
                 }
             } else {
                 setFabStatus(btn, '📂 获取项目外对话…');
                 const orphanIds = await collectIds(btn, workspaceId, null);
-                for (let i = 0; i < orphanIds.length; i++) {
+                for (let i = 0; i < orphanIds.length && !stopped; i++) {
                     setFabStatus(btn, `📥 根目录 (${i + 1}/${orphanIds.length})`);
-                    const convData = await getConversation(orphanIds[i], workspaceId);
-                    await addConversationToZip(zip, convData, workspaceId, attachmentReport);
-                    await sleep(jitter());
+                    await exportOne(zip, { id: orphanIds[i], title: null, folder: null });
                 }
 
-                setFabStatus(btn, '🔍 获取项目列表…');
-                const projects = await getProjects(workspaceId);
-                for (const project of projects) {
-                    const projectFolder = zip.folder(sanitizeFilename(project.title));
-                    setFabStatus(btn, `📂 项目: ${project.title}`);
-                    const projectConvIds = await collectIds(btn, workspaceId, project.id);
-                    if (projectConvIds.length === 0) continue;
+                if (!stopped) {
+                    setFabStatus(btn, '🔍 获取项目列表…');
+                    const projects = await getProjects(workspaceId);
+                    for (const project of projects) {
+                        if (stopped) break;
+                        const projectFolder = zip.folder(sanitizeFilename(project.title));
+                        setFabStatus(btn, `📂 项目: ${project.title}`);
+                        let projectConvIds;
+                        try {
+                            projectConvIds = await collectIds(btn, workspaceId, project.id);
+                        } catch (error) {
+                            recordExportIssue(errorReport, { folder: project.title }, 'list', error);
+                            if (error?.stopsBatch) {
+                                errorReport.stopped_reason = error.message;
+                                stopped = true;
+                            }
+                            continue;
+                        }
 
-                    for (let i = 0; i < projectConvIds.length; i++) {
-                        setFabStatus(btn, `📥 ${project.title.substring(0,10)}... (${i + 1}/${projectConvIds.length})`);
-                        const convData = await getConversation(projectConvIds[i], workspaceId);
-                        await addConversationToZip(projectFolder, convData, workspaceId, attachmentReport);
-                        await sleep(jitter());
+                        for (let i = 0; i < projectConvIds.length && !stopped; i++) {
+                            setFabStatus(btn, `📥 ${project.title.substring(0,10)}... (${i + 1}/${projectConvIds.length})`);
+                            await exportOne(projectFolder, { id: projectConvIds[i], title: null, folder: project.title });
+                        }
                     }
                 }
             }
 
             if (attachmentReport) {
                 zip.file('attachment-export-report.json', JSON.stringify(attachmentReport, null, 2));
+            }
+            const hasIssues = errorReport.issues.length > 0;
+            if (hasIssues) {
+                zip.file('export-error-report.json', JSON.stringify(errorReport, null, 2));
             }
             setFabStatus(btn, '📦 生成 ZIP 文件…');
             const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
@@ -1080,8 +1179,8 @@ html.dark #gre-fab-status {
             const attachmentSummary = attachmentReport
                 ? `\n附件：检测 ${attachmentReport.detected}，成功 ${attachmentReport.downloaded}，失败 ${attachmentReport.failed}。`
                 : '';
-            alert(`✅ 导出完成！${attachmentSummary}`);
-            setFabStatus(btn, '✅ 完成');
+            alert(`${buildExportSummary(errorReport)}${attachmentSummary}`);
+            setFabStatus(btn, hasIssues ? '⚠️ 部分完成' : '✅ 完成');
 
         } catch (e) {
             console.error("导出过程中发生严重错误:", e);
@@ -1155,6 +1254,14 @@ html.dark #gre-fab-status {
     }
 
     // --- API 调用函数 ---
+    // 401（登录失效）和 429（限流）会让后续每个请求同样失败，批量导出应停止，而不是逐个跳过。
+    function createHttpError(message, status) {
+        const error = new Error(message);
+        error.status = status;
+        error.stopsBatch = status === 401 || status === 429;
+        return error;
+    }
+
     function normalizeProjectSpaceItem(item) {
         const rawGizmo = item?.gizmo?.gizmo || item?.gizmo || item;
         const display = rawGizmo?.display || item?.gizmo?.display || item?.display;
@@ -1251,7 +1358,7 @@ html.dark #gre-fab-status {
             let cursor = '0';
             do {
                 const r = await fetch(`/backend-api/gizmos/${gizmoId}/conversations?cursor=${cursor}`, { headers });
-                if (!r.ok) throw new Error(`列举项目对话列表失败 (${r.status})`);
+                if (!r.ok) throw createHttpError(`列举项目对话列表失败 (${r.status})`, r.status);
                 const j = await r.json();
                 j.items?.forEach(it => all.add(it.id));
                 cursor = j.cursor;
@@ -1263,7 +1370,7 @@ html.dark #gre-fab-status {
                 do {
                     setFabStatus(btn, `📂 项目外对话 (${is_archived ? 'Archived' : 'Active'} p${++page})`);
                     const r = await fetch(`/backend-api/conversations?offset=${offset}&limit=${PAGE_LIMIT}&order=updated${is_archived ? '&is_archived=true' : ''}`, { headers });
-                    if (!r.ok) throw new Error(`列举项目外对话列表失败 (${r.status})`);
+                    if (!r.ok) throw createHttpError(`列举项目外对话列表失败 (${r.status})`, r.status);
                     const j = await r.json();
                     if (j.items && j.items.length > 0) {
                         j.items.forEach(it => all.add(it.id));
@@ -1424,7 +1531,9 @@ html.dark #gre-fab-status {
     async function getConversation(id, workspaceId) {
         const deviceId = getOaiDeviceId();
         if (!deviceId) {
-            throw new Error('无法获取 oai-device-id，请确保已登录并刷新页面。');
+            const error = new Error('无法获取 oai-device-id，请确保已登录并刷新页面。');
+            error.stopsBatch = true;
+            throw error;
         }
         const headers = {
             'Authorization': `Bearer ${accessToken}`,
@@ -1435,9 +1544,9 @@ html.dark #gre-fab-status {
         const r = await fetch(`/backend-api/conversation/${id}`, { headers });
         if (!r.ok) {
             if (r.status === 429) {
-                throw new Error(`获取对话详情失败 conv ${id}：官方接口限流 (429)。请降低导出频率、减少单次导出的对话数量，等待几分钟后再试。`);
+                throw createHttpError(`获取对话详情失败 conv ${id}：官方接口限流 (429)。请降低导出频率、减少单次导出的对话数量，等待几分钟后再试。`, 429);
             }
-            throw new Error(`获取对话详情失败 conv ${id} (${r.status})`);
+            throw createHttpError(`获取对话详情失败 conv ${id} (${r.status})`, r.status);
         }
         const j = await r.json();
         j.__fetched_at = new Date().toISOString();

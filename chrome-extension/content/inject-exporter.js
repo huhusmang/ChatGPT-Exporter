@@ -1,5 +1,5 @@
 (function injectExporter() {
-    const EXPECTED_VERSION = '1.5.0';
+    const EXPECTED_VERSION = '1.5.1';
     const activeVersion = document.documentElement.getAttribute('data-chatgpt-exporter-version');
     if (window.__CHATGPT_EXPORTER_INJECTED__ === EXPECTED_VERSION && activeVersion === EXPECTED_VERSION) return;
     window.__CHATGPT_EXPORTER_INJECTED__ = EXPECTED_VERSION;

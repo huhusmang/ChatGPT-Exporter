@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { FakeChatGPT, loadExporter, makeConversation, waitFor } from './helpers/harness.mjs';
+import { FakeChatGPT, loadExporter, makeConversation, waitFor, waitForResult } from './helpers/harness.mjs';
 
 const json = (data, status = 200, headers = {}) => new Response(JSON.stringify(data), {
     status,
@@ -12,8 +12,6 @@ function startFullExport(env, { incremental = false } = {}) {
     if (incremental) env.click('#incremental-export');
     env.click('#select-personal-btn');
 }
-
-const waitForResult = (env, count = 1) => waitFor(() => env.alerts[count - 1], { message: '导出结果提示' });
 
 test('401 时刷新一次 Token 后重试', async () => {
     const api = new FakeChatGPT().addConversation(makeConversation('a'));
@@ -121,10 +119,10 @@ test('增量导出只导出新增或更新过的对话', async () => {
     assert.ok(second.find(/Title b/));
     assert.ok(second.find(/Title c/));
     assert.match(env.downloadNames[0], /^chatgpt_personal_incremental_\d{4}-\d{2}-\d{2}\.zip$/);
-    assert.match(await waitForResult(env, 2), /跳过了 1 个/);
+    assert.match((await waitForResult(env, 2)).message, /跳过了 1 个/);
 
     startFullExport(env, { incremental: true });
-    assert.match(await waitForResult(env, 3), /没有需要导出的对话/);
+    assert.equal((await waitForResult(env, 3)).title, '没有需要导出的对话');
     assert.equal(env.downloads.length, 2, '没有变化时不应生成 ZIP');
     env.close();
 });
@@ -138,7 +136,7 @@ test('导出进行中不能再启动第二个导出', async () => {
     startFullExport(env);
     await waitFor(() => api.detailRequests().includes('a'), { message: '开始请求对话' });
     startFullExport(env);
-    assert.match(env.alerts[0] || '', /已有导出任务正在进行/);
+    assert.match(env.$('#gre-toast')?.textContent || '', /已有导出任务正在进行/);
     release();
     await env.readZip();
     assert.equal(api.detailRequests().length, 1);

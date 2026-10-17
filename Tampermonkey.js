@@ -66,7 +66,9 @@
         }
     }
 
-    async function ensureAccessToken({ forceRefresh = false, silent = false } = {}) {
+    const ACCESS_TOKEN_HINT = '无法获取 Access Token。请刷新页面或打开任意一个对话后再试。';
+
+    async function ensureAccessToken({ forceRefresh = false } = {}) {
         if (accessToken && !forceRefresh) return accessToken;
         try {
             const session = await (await fetch('/api/auth/session?unstable_client=true')).json();
@@ -75,7 +77,6 @@
                 return accessToken;
             }
         } catch (_) {}
-        if (!silent) alert('无法获取 Access Token。请刷新页面或打开任意一个对话后再试。');
         return null;
     }
     // --- 辅助函数 ---
@@ -540,11 +541,31 @@
         return messages;
     }
 
+    function toIsoTime(value) {
+        const seconds = normalizeEpochSeconds(value);
+        return seconds ? new Date(seconds * 1000).toISOString() : null;
+    }
+
+    // JSON.stringify 的转义是 YAML 双引号字符串的子集，可以直接当作 YAML 字符串值。
+    function buildMarkdownFrontMatter(convData) {
+        const id = convData?.conversation_id || convData?.id || null;
+        const fields = [
+            ['title', convData?.title || 'Untitled Conversation'],
+            ['conversation_id', id],
+            ['created', toIsoTime(convData?.create_time)],
+            ['updated', toIsoTime(convData?.update_time)],
+            ['url', id ? `https://chatgpt.com/c/${id}` : null],
+            ['exported_by', `ChatGPT Exporter v${EXPORTER_VERSION}`]
+        ].filter(([, value]) => value);
+        return ['---', ...fields.map(([key, value]) => `${key}: ${JSON.stringify(String(value))}`), '---', ''];
+    }
+
     function convertConversationToMarkdown(convData, attachmentResult = null) {
         const messages = extractConversationMessages(convData, attachmentResult);
-        const mdLines = messages.length === 0
-            ? ['# Conversation', 'No visible user or assistant messages were exported.', '']
-            : [];
+        const mdLines = buildMarkdownFrontMatter(convData);
+        if (messages.length === 0) {
+            mdLines.push('# Conversation', 'No visible user or assistant messages were exported.', '');
+        }
         messages.forEach(msg => {
             const roleLabel = msg.role === 'user' ? '# User' : '# Assistant';
             mdLines.push(roleLabel);
@@ -1030,11 +1051,16 @@ html.dark #gre-fab-status {
         };
     }
 
+    function cancelActiveExport() {
+        if (!activeExport || activeExport.cancelled) return;
+        activeExport.cancelled = true;
+        activeExport.progress('⏹ 正在停止…');
+    }
+
     function requestCancelActiveExport() {
         if (!activeExport || activeExport.cancelled) return;
         if (!confirm('要停止当前导出吗？已经导出的对话会照常打包下载。')) return;
-        activeExport.cancelled = true;
-        activeExport.progress('⏹ 正在停止…');
+        cancelActiveExport();
     }
 
     // JSON 是无损备份，必须最先写入；附件或 Markdown 出错只降级为部分成功，不影响已写入的 JSON。
@@ -1132,21 +1158,33 @@ html.dark #gre-fab-status {
         return { outcome: 'partial', updateTime };
     }
 
-    function buildExportSummary(errorReport, { skippedUnchanged = 0 } = {}) {
-        const skippedLine = skippedUnchanged > 0
-            ? `\n增量导出：跳过了 ${skippedUnchanged} 个自上次导出后没有变化的对话。`
-            : '';
-        if (errorReport.issues.length === 0 && !errorReport.stopped_reason) {
-            return `✅ 导出完成！共 ${errorReport.succeeded} 个对话。${skippedLine}`;
+    function buildExportSummary(errorReport, { skippedUnchanged = 0, zipCreated = true } = {}) {
+        const clean = errorReport.issues.length === 0 && !errorReport.stopped_reason;
+        const lines = [];
+        if (clean) {
+            lines.push(`共导出 ${errorReport.succeeded} 个对话。`);
+        } else {
+            if (errorReport.stopped_reason) {
+                lines.push(`导出已提前停止${zipCreated ? '，ZIP 中只包含停止前导出的对话' : ''}。原因：${errorReport.stopped_reason}`);
+            }
+            lines.push(`成功 ${errorReport.succeeded}，部分成功（已存 JSON，缺 Markdown 或附件）${errorReport.partial}，失败 ${errorReport.failed}。`);
+            const listFailures = errorReport.issues.filter(issue => issue.stage === 'list').length;
+            if (listFailures > 0) lines.push(`另有 ${listFailures} 处对话列表获取失败，可能漏掉了部分项目对话。`);
         }
-        const head = errorReport.stopped_reason
-            ? `⚠️ 导出已提前停止，ZIP 中只包含停止前导出的对话。\n原因：${errorReport.stopped_reason}`
-            : '⚠️ 导出完成，但有部分内容失败。';
-        const listFailures = errorReport.issues.filter(issue => issue.stage === 'list').length;
-        const listLine = listFailures > 0 ? `\n另有 ${listFailures} 处对话列表获取失败，可能漏掉了部分项目对话。` : '';
-        return `${head}\n成功 ${errorReport.succeeded}，部分成功（已存 JSON，缺 Markdown 或附件）${errorReport.partial}，失败 ${errorReport.failed}。${listLine}${skippedLine}\n详情见 ZIP 内的 export-error-report.json。`;
+        if (skippedUnchanged > 0) {
+            lines.push(`增量导出：跳过了 ${skippedUnchanged} 个自上次导出后没有变化的对话。`);
+        }
+        if (!clean) {
+            lines.push(zipCreated
+                ? '详情见 ZIP 内的 export-error-report.json。'
+                : '没有导出任何对话，因此没有生成 ZIP。详情请查看控制台。');
+        }
+        let title = '导出完成';
+        if (!zipCreated) title = '导出失败';
+        else if (errorReport.stopped_reason) title = '导出已停止';
+        else if (!clean) title = '导出完成，部分内容失败';
+        return { tone: clean ? 'ok' : zipCreated ? 'warn' : 'error', title, message: lines.join('\n') };
     }
-
     // --- 增量导出记录：按账户记住每个对话上次导出时的更新时间 ---
     const EXPORT_HISTORY_KEY = 'chatgpt-exporter-history-v1';
 
@@ -1200,12 +1238,19 @@ html.dark #gre-fab-status {
         return `chatgpt_${space}_${kind}${workspacePart}_${localDateStamp()}.zip`;
     }
 
-    function showExportResult(message) {
-        alert(message);
-    }
+    let resultSeq = 0;
 
-    function showNotice(message) {
-        alert(message);
+    function showExportResult({ tone = 'info', title, message }) {
+        const panel = taskPanelEl();
+        resultSeq += 1;
+        panel.dataset.state = 'result';
+        panel.dataset.tone = tone;
+        panel.dataset.resultSeq = String(resultSeq);
+        panel.querySelector('.gre-task-title').textContent = title;
+        panel.querySelector('.gre-task-body').textContent = message;
+        panel.querySelector('.gre-progress-bar').hidden = true;
+        panel.querySelector('.gre-task-actions').hidden = true;
+        panel.querySelector('.gre-task-close').hidden = false;
     }
 
     async function exportConversations(options = {}) {
@@ -1217,13 +1262,19 @@ html.dark #gre-fab-status {
             incremental = false
         } = options;
         if (activeExport) {
-            showNotice('已有导出任务正在进行。点击悬浮球可以停止当前导出。');
+            showNotice('已有导出任务正在进行。可以在右下角的进度面板中停止当前导出。');
             return;
         }
         const btn = getExportButton();
-        if (!await ensureAccessToken()) return;
+        if (!await ensureAccessToken()) {
+            showExportResult({ tone: 'error', title: '无法开始导出', message: ACCESS_TOKEN_HINT });
+            return;
+        }
 
-        const session = createTaskSession(text => setFabStatus(btn, text));
+        const session = createTaskSession(text => {
+            setFabStatus(btn, text);
+            showTaskProgress(text);
+        });
         activeExport = session;
         const accountId = resolveWorkspaceId(workspaceId);
         const selected = Array.isArray(conversationEntries) && conversationEntries.length > 0;
@@ -1260,8 +1311,8 @@ html.dark #gre-fab-status {
                     ? `\n另有 ${errorReport.issues.length} 处对话列表获取失败，详情请查看控制台。`
                     : '';
                 showExportResult(skippedUnchanged > 0
-                    ? `✅ 没有需要导出的对话：${skippedUnchanged} 个对话自上次导出后都没有变化。${listProblems}`
-                    : `没有找到可以导出的对话。${listProblems}`);
+                    ? { tone: 'ok', title: '没有需要导出的对话', message: `${skippedUnchanged} 个对话自上次导出后都没有变化，没有生成 ZIP。${listProblems}` }
+                    : { tone: 'info', title: '没有找到对话', message: `没有找到可以导出的对话。${listProblems}` });
                 return;
             }
 
@@ -1274,7 +1325,7 @@ html.dark #gre-fab-status {
                     break;
                 }
                 const entry = entries[i];
-                const label = entry?.title ? entry.title.slice(0, 12) : '对话';
+                const label = entry?.title ? entry.title.slice(0, 24) : '对话';
                 session.progress(`📥 ${label} (${i + 1}/${entries.length})`);
                 const target = entry?.projectTitle
                     ? zip.folder(sanitizeFilename(entry.projectTitle))
@@ -1292,7 +1343,7 @@ html.dark #gre-fab-status {
             }
 
             if (exported.length === 0) {
-                showExportResult(`${buildExportSummary(errorReport, { skippedUnchanged })}`.replace(/\n详情见 ZIP 内的 export-error-report\.json。$/, '\n没有导出任何对话，因此没有生成 ZIP。详情请查看控制台。'));
+                showExportResult(buildExportSummary(errorReport, { skippedUnchanged, zipCreated: false }));
                 return;
             }
 
@@ -1314,18 +1365,19 @@ html.dark #gre-fab-status {
             downloadFile(blob, buildZipFilename({ mode, workspaceId, selected, incremental: incremental && !selected }));
             saveExportHistory(accountId, history, exported);
 
-            const attachmentSummary = attachmentReport
-                ? `\n附件：检测 ${attachmentReport.detected}，成功 ${attachmentReport.downloaded}，失败 ${attachmentReport.failed}。`
-                : '';
+            const summary = buildExportSummary(errorReport, { skippedUnchanged });
+            if (attachmentReport) {
+                summary.message += `\n附件：检测 ${attachmentReport.detected}，成功 ${attachmentReport.downloaded}，失败 ${attachmentReport.failed}。`;
+            }
             finalStatus = hasIssues ? '⚠️ 部分完成' : '✅ 完成';
-            showExportResult(`${buildExportSummary(errorReport, { skippedUnchanged })}${attachmentSummary}`);
+            showExportResult(summary);
         } catch (error) {
             if (error?.cancelled) {
                 finalStatus = '⚠️ 已取消';
-                showExportResult('已取消导出。');
+                showExportResult({ tone: 'info', title: '已取消导出', message: '还没有导出任何对话，因此没有生成 ZIP。' });
             } else {
                 console.error('导出过程中发生严重错误:', error);
-                showExportResult(`导出失败: ${error.message}。详情请查看控制台（F12 -> Console）。`);
+                showExportResult({ tone: 'error', title: '导出失败', message: `${error.message}\n详情请查看控制台（F12 → Console）。` });
             }
         } finally {
             activeExport = null;
@@ -1335,7 +1387,6 @@ html.dark #gre-fab-status {
             }, 3000);
         }
     }
-
     function startExportProcess(mode, workspaceId, options = {}) {
         return exportConversations({ mode, workspaceId, ...options });
     }
@@ -1398,7 +1449,7 @@ html.dark #gre-fab-status {
 
             if (response.status === 401 && !tokenRefreshed) {
                 tokenRefreshed = true;
-                if (await ensureAccessToken({ forceRefresh: true, silent: true })) continue;
+                if (await ensureAccessToken({ forceRefresh: true })) continue;
             }
             if (response.status === 429 && rateLimitRetries < RATE_LIMIT_RETRY_DELAYS.length) {
                 const delay = retryAfterMs(response) ?? RATE_LIMIT_RETRY_DELAYS[rateLimitRetries];
@@ -1589,7 +1640,6 @@ html.dark #gre-fab-status {
         return data;
     }
     // --- UI 相关函数 ---
-    // (UI部分无变动，此处省略以保持简洁)
     /**
      * [新增] 全面检测函数，返回所有找到的ID
      * @returns {string[]} - 返回包含所有唯一Workspace ID的数组
@@ -1631,27 +1681,246 @@ html.dark #gre-fab-status {
         return Array.from(foundIds);
     }
 
-    function showConversationPicker(options = {}) {
-        const { mode = 'personal', workspaceId = null, includeAttachments = false } = options;
+    const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    })[ch]);
+
+    // 跟随 ChatGPT 页面的 html.dark 切换深色；所有颜色都走 CSS 变量，避免被页面样式覆盖。
+    function ensureUiStyle() {
+        if (document.getElementById('gre-ui-style')) return;
+        const style = document.createElement('style');
+        style.id = 'gre-ui-style';
+        style.textContent = `
+.gre-theme {
+    --gre-bg: #fff; --gre-fg: #0d0d0d; --gre-muted: #6b7280; --gre-border: #e5e7eb; --gre-subtle: #f7f7f8;
+    --gre-accent: #10a37f; --gre-accent-fg: #fff; --gre-danger: #b91c1c; --gre-warn: #92400e; --gre-warn-bg: #fffbeb;
+    --gre-info: #4338ca; --gre-info-bg: #eef2ff; --gre-ok: #166534; --gre-ok-bg: #f0fdf4;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 14px; line-height: 1.45; color: var(--gre-fg); color-scheme: light;
+}
+html.dark .gre-theme {
+    --gre-bg: #212121; --gre-fg: #ececec; --gre-muted: #a1a1aa; --gre-border: #3f3f46; --gre-subtle: #2a2a2a;
+    --gre-accent: #19c37d; --gre-accent-fg: #0d0d0d; --gre-danger: #f87171; --gre-warn: #fbbf24; --gre-warn-bg: rgba(251, 191, 36, .1);
+    --gre-info: #a5b4fc; --gre-info-bg: rgba(99, 102, 241, .16); --gre-ok: #86efac; --gre-ok-bg: rgba(34, 197, 94, .12);
+    color-scheme: dark;
+}
+.gre-theme *, .gre-theme *::before, .gre-theme *::after { box-sizing: border-box; }
+.gre-overlay {
+    position: fixed; inset: 0; z-index: 99998; padding: 16px;
+    display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, .45);
+}
+.gre-dialog {
+    width: 100%; max-width: 460px; max-height: calc(100vh - 32px); overflow: auto; padding: 22px;
+    background: var(--gre-bg); border-radius: 14px; box-shadow: 0 12px 40px rgba(0, 0, 0, .3);
+}
+.gre-dialog.gre-wide { max-width: 760px; display: flex; flex-direction: column; }
+.gre-dialog h2 { margin: 0; font-size: 18px; font-weight: 600; }
+.gre-header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+.gre-muted { color: var(--gre-muted); font-size: 12px; }
+.gre-stack { display: flex; flex-direction: column; gap: 10px; }
+.gre-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.gre-spread { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+.gre-section { margin-top: 14px; }
+.gre-footer { margin-top: 18px; }
+.gre-card { padding: 14px 16px; border: 1px solid var(--gre-border); border-radius: 10px; background: var(--gre-subtle); }
+.gre-card strong { font-size: 15px; }
+.gre-card p { margin: 2px 0 10px; color: var(--gre-muted); font-size: 13px; }
+.gre-btn {
+    padding: 7px 14px; border: 1px solid var(--gre-border); border-radius: 8px; background: var(--gre-bg);
+    color: var(--gre-fg); font: inherit; font-size: 13px; cursor: pointer;
+}
+.gre-btn:hover:not(:disabled) { background: var(--gre-subtle); }
+.gre-btn:disabled { opacity: .5; cursor: not-allowed; }
+.gre-btn-primary { background: var(--gre-accent); border-color: var(--gre-accent); color: var(--gre-accent-fg); font-weight: 600; }
+.gre-btn-primary:hover:not(:disabled) { background: var(--gre-accent); filter: brightness(1.08); }
+.gre-link { padding: 0; border: none; background: none; color: var(--gre-info); font: inherit; font-size: 12px; cursor: pointer; }
+.gre-link:hover { text-decoration: underline; }
+.gre-theme :focus-visible { outline: 2px solid var(--gre-accent); outline-offset: 1px; }
+.gre-option {
+    display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; cursor: pointer;
+    border: 1px solid var(--gre-border); border-radius: 10px; background: var(--gre-subtle);
+}
+.gre-option input { margin-top: 3px; accent-color: var(--gre-accent); }
+.gre-option strong { display: block; font-size: 13px; font-weight: 600; }
+.gre-input {
+    padding: 7px 9px; border: 1px solid var(--gre-border); border-radius: 8px; background: var(--gre-bg);
+    color: var(--gre-fg); font: inherit; font-size: 13px; min-width: 0;
+}
+.gre-grow { flex: 1 1 200px; }
+.gre-filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.gre-notice { padding: 12px; border-radius: 10px; font-size: 13px; }
+.gre-notice p { margin: 0 0 8px; font-weight: 600; }
+.gre-notice-info { background: var(--gre-info-bg); color: var(--gre-info); }
+.gre-notice-ok { background: var(--gre-ok-bg); color: var(--gre-ok); }
+.gre-notice-warn { background: var(--gre-warn-bg); color: var(--gre-warn); }
+.gre-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-all; }
+.gre-radio { display: flex; align-items: center; gap: 8px; padding: 8px; margin-top: 6px; border-radius: 8px; background: var(--gre-bg); color: var(--gre-fg); cursor: pointer; }
+.gre-error { color: var(--gre-danger); font-size: 12px; }
+.gre-list {
+    flex: 1 1 auto; min-height: 160px; max-height: min(420px, 50vh); overflow: auto;
+    margin-top: 8px; padding: 4px; border: 1px solid var(--gre-border); border-radius: 10px;
+}
+.gre-item { display: flex; gap: 10px; align-items: flex-start; padding: 8px 10px; border-radius: 8px; cursor: pointer; user-select: none; -webkit-user-select: none; }
+.gre-item:hover { background: var(--gre-subtle); }
+.gre-item.gre-checked { background: var(--gre-info-bg); }
+.gre-item input { margin-top: 3px; accent-color: var(--gre-accent); }
+.gre-item-title { font-weight: 600; word-break: break-word; }
+.gre-item-meta { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 2px; }
+.gre-tag { padding: 1px 7px; border-radius: 999px; font-size: 11px; background: var(--gre-info-bg); color: var(--gre-info); }
+.gre-tag-warn { background: var(--gre-warn-bg); color: var(--gre-warn); }
+.gre-empty { padding: 12px 8px; color: var(--gre-muted); }
+.gre-more { width: 100%; margin-top: 4px; }
+#conv-status.gre-status-error { color: var(--gre-danger); }
+#conv-status.gre-status-warn { color: var(--gre-warn); }
+
+#gre-task-panel {
+    position: fixed; right: 16px; bottom: 16px; z-index: 99999; width: min(360px, calc(100vw - 32px));
+    padding: 14px 16px; border: 1px solid var(--gre-border); border-left: 4px solid var(--gre-info);
+    border-radius: 12px; background: var(--gre-bg); box-shadow: 0 8px 30px rgba(0, 0, 0, .25);
+}
+#gre-task-panel[data-tone="ok"] { border-left-color: var(--gre-accent); }
+#gre-task-panel[data-tone="warn"] { border-left-color: var(--gre-warn); }
+#gre-task-panel[data-tone="error"] { border-left-color: var(--gre-danger); }
+.gre-task-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 4px; }
+.gre-task-title { font-weight: 600; }
+.gre-task-body { max-height: 40vh; overflow: auto; font-size: 13px; white-space: pre-wrap; word-break: break-word; }
+.gre-task-close { padding: 0 4px; border: none; background: none; color: var(--gre-muted); font-size: 18px; line-height: 1; cursor: pointer; }
+.gre-progress-bar { height: 4px; margin-top: 10px; overflow: hidden; border-radius: 999px; background: var(--gre-border); }
+.gre-progress-bar > span { display: block; width: 0; height: 100%; background: var(--gre-accent); transition: width .2s; }
+.gre-task-actions { display: flex; justify-content: flex-end; margin-top: 10px; }
+#gre-toast {
+    position: fixed; left: 50%; bottom: 24px; z-index: 100000; max-width: calc(100vw - 32px); transform: translateX(-50%);
+    padding: 10px 16px; border: 1px solid var(--gre-border); border-radius: 10px;
+    background: var(--gre-bg); box-shadow: 0 8px 24px rgba(0, 0, 0, .2);
+}
+.gre-theme [hidden] { display: none !important; }
+@media (max-width: 560px) {
+    .gre-dialog { padding: 16px; }
+    .gre-list { max-height: 45vh; }
+}
+`;
+        document.head.appendChild(style);
+    }
+
+    // 只有在遮罩上按下并松开才算点击遮罩，避免在弹窗里拖选文字时误关。
+    function openModal({ wide = false, labelledBy = null, onRequestClose }) {
+        ensureUiStyle();
         const existing = document.getElementById('export-dialog-overlay');
-        if (existing) existing.remove();
+        if (existing) existing.__greClose ? existing.__greClose() : existing.remove();
 
         const overlay = document.createElement('div');
         overlay.id = 'export-dialog-overlay';
-        Object.assign(overlay.style, {
-            position: 'fixed', top: '0', left: '0', width: '100%', height: '100%',
-            backgroundColor: 'rgba(0, 0, 0, 0.5)', zIndex: '99998',
-            display: 'flex', alignItems: 'center', justifyContent: 'center'
-        });
-
+        overlay.className = 'gre-theme gre-overlay';
         const dialog = document.createElement('div');
         dialog.id = 'export-dialog';
-        Object.assign(dialog.style, {
-            background: '#fff', padding: '24px', borderRadius: '12px',
-            boxShadow: '0 5px 15px rgba(0,0,0,.3)', width: '720px',
-            fontFamily: 'sans-serif', color: '#333', boxSizing: 'border-box'
-        });
+        dialog.className = wide ? 'gre-dialog gre-wide' : 'gre-dialog';
+        dialog.setAttribute('role', 'dialog');
+        dialog.setAttribute('aria-modal', 'true');
+        if (labelledBy) dialog.setAttribute('aria-labelledby', labelledBy);
+        overlay.appendChild(dialog);
 
+        let pressedOnOverlay = false;
+        overlay.addEventListener('mousedown', e => { pressedOnOverlay = e.target === overlay; });
+        overlay.addEventListener('click', e => {
+            if (pressedOnOverlay && e.target === overlay) onRequestClose();
+            pressedOnOverlay = false;
+        });
+        const onKeydown = e => {
+            if (e.key !== 'Escape') return;
+            e.stopPropagation();
+            onRequestClose();
+        };
+        document.addEventListener('keydown', onKeydown, true);
+        const close = () => {
+            document.removeEventListener('keydown', onKeydown, true);
+            overlay.remove();
+        };
+        overlay.__greClose = close;
+        document.body.appendChild(overlay);
+        return { overlay, dialog, close };
+    }
+
+    function taskPanelEl() {
+        ensureUiStyle();
+        let panel = document.getElementById('gre-task-panel');
+        if (panel) return panel;
+        panel = document.createElement('div');
+        panel.id = 'gre-task-panel';
+        panel.className = 'gre-theme';
+        panel.setAttribute('role', 'status');
+        panel.setAttribute('aria-live', 'polite');
+        panel.innerHTML = `
+            <div class="gre-task-head">
+                <span class="gre-task-title"></span>
+                <button type="button" class="gre-task-close" aria-label="关闭" hidden>×</button>
+            </div>
+            <div class="gre-task-body"></div>
+            <div class="gre-progress-bar" hidden><span></span></div>
+            <div class="gre-task-actions" hidden><button type="button" class="gre-btn gre-task-stop">停止导出</button></div>`;
+        panel.querySelector('.gre-task-close').onclick = () => panel.remove();
+        panel.querySelector('.gre-task-stop').onclick = cancelActiveExport;
+        document.body.appendChild(panel);
+        return panel;
+    }
+
+    function showTaskProgress(text) {
+        const panel = taskPanelEl();
+        panel.dataset.state = 'progress';
+        panel.dataset.tone = 'info';
+        panel.querySelector('.gre-task-title').textContent = '正在导出';
+        panel.querySelector('.gre-task-body').textContent = text;
+        const match = /\((\d+)\s*\/\s*(\d+)\)/.exec(text);
+        const bar = panel.querySelector('.gre-progress-bar');
+        bar.hidden = !match;
+        if (match && Number(match[2]) > 0) {
+            bar.firstElementChild.style.width = `${Math.min(100, (Number(match[1]) / Number(match[2])) * 100)}%`;
+        }
+        panel.querySelector('.gre-task-actions').hidden = false;
+        const stop = panel.querySelector('.gre-task-stop');
+        stop.disabled = Boolean(activeExport?.cancelled);
+        stop.textContent = activeExport?.cancelled ? '正在停止…' : '停止导出';
+        panel.querySelector('.gre-task-close').hidden = true;
+    }
+
+    let toastTimer = null;
+    function showNotice(message) {
+        ensureUiStyle();
+        let toast = document.getElementById('gre-toast');
+        if (!toast) {
+            toast = document.createElement('div');
+            toast.id = 'gre-toast';
+            toast.className = 'gre-theme';
+            toast.setAttribute('role', 'alert');
+            document.body.appendChild(toast);
+        }
+        toast.textContent = message;
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => toast.remove(), 6000);
+    }
+
+    const SPACE_LABELS = { personal: '个人空间', project: '项目空间', team: '团队空间' };
+
+    function showConversationPicker(options = {}) {
+        const { mode = 'personal', workspaceId = null, includeAttachments = false, incremental = false } = options;
+        const state = {
+            loading: true,
+            loadError: null,
+            listWarning: null,
+            list: [],
+            filtered: [],
+            selected: new Set(),
+            anchorIndex: null,
+            query: '',
+            scope: mode === 'project' ? 'project' : 'all',
+            scopeLocked: mode === 'project',
+            archived: 'all',
+            timeField: 'update',
+            pageSize: 100,
+            visibleCount: 100,
+            startDate: '',
+            endDate: '',
+            includeAttachments: Boolean(includeAttachments)
+        };
         // 关闭选择器时停止仍在进行的列表加载，避免关闭后继续请求接口。
         const listSession = createTaskSession(text => {
             const statusEl = dialog.querySelector('#conv-status');
@@ -1659,158 +1928,115 @@ html.dark #gre-fab-status {
         });
         const closeDialog = () => {
             listSession.cancelled = true;
-            overlay.remove();
+            modal.close();
         };
-        const state = {
-            loadError: null,
-            listWarning: null,
-            list: [],
-            filtered: [],
-            selected: new Set(),
-            query: '',
-            scope: mode === 'project' ? 'project' : 'all',
-            scopeLocked: mode === 'project',
-            archived: 'all',
-            timeField: 'update',
-            loading: true,
-            pageSize: 100,
-            visibleCount: 100,
-            startDate: '',
-            endDate: '',
-            includeAttachments: Boolean(includeAttachments)
+        const requestClose = () => {
+            if (state.selected.size > 0 && !confirm(`关闭后会丢失已选的 ${state.selected.size} 个对话，确定关闭吗？`)) return;
+            closeDialog();
         };
+        const modal = openModal({ wide: true, labelledBy: 'gre-picker-title', onRequestClose: requestClose });
+        const { dialog } = modal;
 
-        const renderBase = () => {
-            const modeLabel = mode === 'team' ? '团队空间' : mode === 'project' ? '项目空间' : '个人空间';
-            const workspaceLabel = workspaceId ? `（${workspaceId}）` : '';
-            dialog.innerHTML = `
-                <h2 style="margin-top:0; margin-bottom: 12px; font-size: 18px;">选择要导出的对话</h2>
-                <div style="margin-bottom: 12px; color: #666; font-size: 12px;">空间：${modeLabel}${workspaceLabel}</div>
-                <div style="display: flex; gap: 8px; margin-bottom: 8px;">
-                    <input id="conv-search" type="text" placeholder="搜索标题/项目名/ID"
-                        style="flex: 1; padding: 8px; border-radius: 6px; border: 1px solid #ccc; box-sizing: border-box;">
-                    <select id="filter-scope" style="padding: 8px 28px 8px 8px; border-radius: 6px; border: 1px solid #ccc;">
-                        <option value="all">全部范围</option>
-                        <option value="project">仅项目</option>
-                        <option value="root">仅项目外</option>
-                    </select>
-                    <select id="filter-archived" style="padding: 8px 28px 8px 8px; border-radius: 6px; border: 1px solid #ccc;">
-                        <option value="all">全部状态</option>
-                        <option value="active">仅未归档</option>
-                        <option value="archived">仅已归档</option>
-                    </select>
+        dialog.innerHTML = `
+            <div class="gre-header">
+                <h2 id="gre-picker-title">选择要导出的对话</h2>
+                <span class="gre-muted">${SPACE_LABELS[mode] || SPACE_LABELS.personal}${workspaceId ? `（<span class="gre-code">${escapeHtml(workspaceId)}</span>）` : ''}</span>
+            </div>
+            <div class="gre-filters">
+                <input id="conv-search" class="gre-input gre-grow" type="search" placeholder="搜索标题、项目名或 ID" aria-label="搜索对话">
+                <select id="filter-scope" class="gre-input" aria-label="范围">
+                    <option value="all">全部范围</option>
+                    <option value="project">仅项目</option>
+                    <option value="root">仅项目外</option>
+                </select>
+                <select id="filter-archived" class="gre-input" aria-label="归档状态">
+                    <option value="all">全部状态</option>
+                    <option value="active">仅未归档</option>
+                    <option value="archived">仅已归档</option>
+                </select>
+            </div>
+            <div class="gre-filters">
+                <select id="filter-time-field" class="gre-input" aria-label="时间字段">
+                    <option value="update">按更新时间</option>
+                    <option value="create">按创建时间</option>
+                </select>
+                <input id="filter-start-date" class="gre-input" type="date" aria-label="开始日期">
+                <span class="gre-muted">至</span>
+                <input id="filter-end-date" class="gre-input" type="date" aria-label="结束日期">
+                <button id="clear-date-btn" class="gre-btn" type="button">清空日期</button>
+            </div>
+            <label class="gre-option">
+                <input id="include-attachments-picker" type="checkbox" ${state.includeAttachments ? 'checked' : ''}>
+                <span>
+                    <strong>同时下载上传和生成的附件</strong>
+                    <span class="gre-muted">开启后导出时间和 ZIP 体积可能明显增加。</span>
+                </span>
+            </label>
+            <div class="gre-spread gre-section">
+                <div id="conv-status" class="gre-muted" role="status">正在加载列表…</div>
+                <div class="gre-row">
+                    <button id="select-all-btn" class="gre-btn" type="button" disabled>全选筛选结果</button>
+                    <button id="clear-all-btn" class="gre-btn" type="button" disabled>清空选择</button>
                 </div>
-                <div style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center;">
-                    <select id="filter-time-field" style="padding: 8px 28px 8px 8px; border-radius: 6px; border: 1px solid #ccc;">
-                        <option value="update">按更新时间</option>
-                        <option value="create">按创建时间</option>
-                    </select>
-                    <input id="filter-start-date" type="date" style="padding: 8px; border-radius: 6px; border: 1px solid #ccc;">
-                    <span style="color: #666; font-size: 12px;">至</span>
-                    <input id="filter-end-date" type="date" style="padding: 8px; border-radius: 6px; border: 1px solid #ccc;">
-                    <button id="clear-date-btn" style="padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer;">清空日期</button>
-                </div>
-                <label style="display: flex; align-items: flex-start; gap: 8px; margin-bottom: 10px; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px; background: #f9fafb; cursor: pointer;">
-                    <input id="include-attachments-picker" type="checkbox" ${state.includeAttachments ? 'checked' : ''} style="margin-top: 2px;">
-                    <span>
-                        <strong style="display: block; font-size: 13px;">同时下载上传和生成的附件</strong>
-                        <span style="display: block; margin-top: 2px; color: #666; font-size: 12px;">默认关闭；开启后导出时间和 ZIP 体积可能明显增加。</span>
-                    </span>
-                </label>
-                <div id="conv-status" style="margin-bottom: 8px; font-size: 12px; color: #666;">正在加载列表...</div>
-                <div id="conv-list" style="max-height: 360px; overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px; background: #fff;"></div>
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 16px;">
-                    <div style="display: flex; gap: 8px;">
-                        <button id="select-all-btn" style="padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer;">全选</button>
-                        <button id="clear-all-btn" style="padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer;">清空</button>
-                    </div>
-                    <div style="display: flex; gap: 8px;">
-                        <button id="back-btn" style="padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer;">返回</button>
-                        <button id="export-selected-btn" style="padding: 8px 12px; border: none; border-radius: 6px; background: #10a37f; color: #fff; cursor: pointer; font-weight: bold;" disabled>导出选中 (0)</button>
-                    </div>
-                </div>
-            `;
+            </div>
+            <div id="conv-list" class="gre-list" aria-labelledby="gre-picker-title"></div>
+            <div class="gre-muted" style="margin-top: 6px;">按住 Shift 点击可以连续选择多个对话。</div>
+            <div class="gre-spread gre-footer">
+                <button id="back-btn" class="gre-btn" type="button">返回</button>
+                <button id="export-selected-btn" class="gre-btn gre-btn-primary" type="button" disabled>导出选中 (0)</button>
+            </div>
+        `;
 
-            const searchInput = dialog.querySelector('#conv-search');
-            const scopeSelect = dialog.querySelector('#filter-scope');
-            const archivedSelect = dialog.querySelector('#filter-archived');
-            const timeFieldSelect = dialog.querySelector('#filter-time-field');
-            const startDateInput = dialog.querySelector('#filter-start-date');
-            const endDateInput = dialog.querySelector('#filter-end-date');
-            const includeAttachmentsInput = dialog.querySelector('#include-attachments-picker');
-            const clearDateBtn = dialog.querySelector('#clear-date-btn');
-            const selectAllBtn = dialog.querySelector('#select-all-btn');
-            const clearAllBtn = dialog.querySelector('#clear-all-btn');
-            const backBtn = dialog.querySelector('#back-btn');
-            const exportBtn = dialog.querySelector('#export-selected-btn');
+        const $ = selector => dialog.querySelector(selector);
+        const statusEl = $('#conv-status');
+        const listEl = $('#conv-list');
+        const selectAllBtn = $('#select-all-btn');
+        const clearAllBtn = $('#clear-all-btn');
+        const exportBtn = $('#export-selected-btn');
 
-            if (state.scopeLocked && scopeSelect) {
-                scopeSelect.value = 'project';
-                scopeSelect.disabled = true;
-                scopeSelect.style.opacity = '0.7';
-                scopeSelect.style.cursor = 'not-allowed';
-                scopeSelect.title = '项目空间仅包含项目对话';
-            }
+        if (state.scopeLocked) {
+            const scopeSelect = $('#filter-scope');
+            scopeSelect.value = 'project';
+            scopeSelect.disabled = true;
+            scopeSelect.title = '项目空间仅包含项目对话';
+        }
 
-            searchInput.oninput = (e) => {
-                state.query = e.target.value || '';
-                applyFilters();
-                renderList();
-            };
-            scopeSelect.onchange = (e) => {
-                state.scope = e.target.value;
-                applyFilters();
-                renderList();
-            };
-            archivedSelect.onchange = (e) => {
-                state.archived = e.target.value;
-                applyFilters();
-                renderList();
-            };
-            timeFieldSelect.onchange = (e) => {
-                state.timeField = e.target.value;
-                applyFilters();
-                renderList();
-            };
-            startDateInput.onchange = (e) => {
-                state.startDate = e.target.value || '';
-                applyFilters();
-                renderList();
-            };
-            endDateInput.onchange = (e) => {
-                state.endDate = e.target.value || '';
-                applyFilters();
-                renderList();
-            };
-            clearDateBtn.onclick = () => {
-                state.startDate = '';
-                state.endDate = '';
-                startDateInput.value = '';
-                endDateInput.value = '';
-                applyFilters();
-                renderList();
-            };
-            includeAttachmentsInput.onchange = (e) => {
-                state.includeAttachments = e.target.checked;
-            };
-            selectAllBtn.onclick = () => {
-                state.filtered.forEach(item => state.selected.add(item.id));
-                renderList();
-            };
-            clearAllBtn.onclick = () => {
-                state.selected.clear();
-                renderList();
-            };
-            backBtn.onclick = () => {
-                closeDialog();
-                showExportDialog({ includeAttachments: state.includeAttachments, incremental: options.incremental });
-            };
-            exportBtn.onclick = async () => {
-                if (state.selected.size === 0) return;
-                const selectedList = state.list.filter(item => state.selected.has(item.id));
-                closeDialog();
-                await startSelectiveExportProcess(mode, workspaceId, selectedList, state.includeAttachments);
-            };
+        const refilter = () => {
+            applyFilters();
+            renderList();
+        };
+        $('#conv-search').oninput = e => { state.query = e.target.value || ''; refilter(); };
+        $('#filter-scope').onchange = e => { state.scope = e.target.value; refilter(); };
+        $('#filter-archived').onchange = e => { state.archived = e.target.value; refilter(); };
+        $('#filter-time-field').onchange = e => { state.timeField = e.target.value; refilter(); };
+        $('#filter-start-date').onchange = e => { state.startDate = e.target.value || ''; refilter(); };
+        $('#filter-end-date').onchange = e => { state.endDate = e.target.value || ''; refilter(); };
+        $('#clear-date-btn').onclick = () => {
+            state.startDate = '';
+            state.endDate = '';
+            $('#filter-start-date').value = '';
+            $('#filter-end-date').value = '';
+            refilter();
+        };
+        $('#include-attachments-picker').onchange = e => { state.includeAttachments = e.target.checked; };
+        selectAllBtn.onclick = () => {
+            state.filtered.forEach(item => state.selected.add(item.id));
+            refreshSelection();
+        };
+        clearAllBtn.onclick = () => {
+            state.selected.clear();
+            state.anchorIndex = null;
+            refreshSelection();
+        };
+        $('#back-btn').onclick = () => {
+            closeDialog();
+            showExportDialog({ includeAttachments: state.includeAttachments, incremental });
+        };
+        exportBtn.onclick = async () => {
+            if (state.selected.size === 0) return;
+            const selectedList = state.list.filter(item => state.selected.has(item.id));
+            closeDialog();
+            await startSelectiveExportProcess(mode, workspaceId, selectedList, state.includeAttachments);
         };
 
         const applyFilters = () => {
@@ -1825,10 +2051,7 @@ html.dark #gre-fab-status {
                 if (state.archived === 'active' && item.is_archived) return false;
                 if (state.archived === 'archived' && !item.is_archived) return false;
                 if (startBound || endBound) {
-                    const sourceTime = state.timeField === 'create'
-                        ? item.create_time
-                        : item.update_time;
-                    const ts = normalizeEpochSeconds(sourceTime || 0);
+                    const ts = normalizeEpochSeconds((state.timeField === 'create' ? item.create_time : item.update_time) || 0);
                     if (!ts) return false;
                     if (startBound && ts < startBound) return false;
                     if (endBound && ts > endBound) return false;
@@ -1836,140 +2059,119 @@ html.dark #gre-fab-status {
                 return true;
             });
             state.visibleCount = state.pageSize;
+            state.anchorIndex = null;
         };
 
-        const renderList = () => {
-            const statusEl = dialog.querySelector('#conv-status');
-            const listEl = dialog.querySelector('#conv-list');
-            const exportBtn = dialog.querySelector('#export-selected-btn');
-            const selectAllBtn = dialog.querySelector('#select-all-btn');
-            const clearAllBtn = dialog.querySelector('#clear-all-btn');
-            const controlsDisabled = state.loading;
+        // 选中状态变化只更新已有行和统计，不重建列表，避免滚动位置跳回顶部。
+        const refreshSelection = () => {
+            listEl.querySelectorAll('.gre-item').forEach(row => {
+                const checked = state.selected.has(row.dataset.id);
+                row.classList.toggle('gre-checked', checked);
+                row.querySelector('input').checked = checked;
+            });
+            const ready = !state.loading && !state.loadError;
+            selectAllBtn.textContent = `全选筛选结果 (${state.filtered.length})`;
+            selectAllBtn.disabled = !ready || state.filtered.length === 0;
+            clearAllBtn.disabled = !ready || state.selected.size === 0;
+            exportBtn.disabled = !ready || state.selected.size === 0;
+            exportBtn.textContent = `导出选中 (${state.selected.size})`;
 
-            if (selectAllBtn) selectAllBtn.disabled = controlsDisabled;
-            if (clearAllBtn) clearAllBtn.disabled = controlsDisabled;
-            if (exportBtn) exportBtn.disabled = controlsDisabled || state.selected.size === 0;
-
-            listEl.innerHTML = '';
-            statusEl.style.color = '#666';
+            statusEl.className = 'gre-muted';
             if (state.loading) return;
             if (state.loadError) {
                 statusEl.textContent = `加载失败：${state.loadError}`;
-                statusEl.style.color = '#b91c1c';
+                statusEl.classList.add('gre-status-error');
                 return;
             }
-
-            const visibleCount = Math.min(state.visibleCount, state.filtered.length);
-            statusEl.textContent = `共 ${state.list.length} 条，当前筛选 ${state.filtered.length} 条，显示 ${visibleCount} 条，已选 ${state.selected.size} 条`
+            statusEl.textContent = `共 ${state.list.length} 条 · 筛选 ${state.filtered.length} 条 · 已选 ${state.selected.size} 条`
                 + (state.listWarning ? `。⚠️ ${state.listWarning}` : '');
-            if (state.listWarning) statusEl.style.color = '#92400e';
-            exportBtn.textContent = `导出选中 (${state.selected.size})`;
-
-            if (state.filtered.length === 0) {
-                const empty = document.createElement('div');
-                empty.textContent = '没有匹配的对话。';
-                empty.style.color = '#999';
-                empty.style.padding = '8px 4px';
-                listEl.appendChild(empty);
-                return;
-            }
-
-            const visibleItems = state.filtered.slice(0, state.visibleCount);
-            visibleItems.forEach(item => {
-                const label = document.createElement('label');
-                Object.assign(label.style, {
-                    display: 'flex', gap: '8px', padding: '8px',
-                    border: '1px solid #e5e7eb', borderRadius: '6px',
-                    marginBottom: '8px', cursor: 'pointer', alignItems: 'flex-start'
-                });
-
-                const checkbox = document.createElement('input');
-                checkbox.type = 'checkbox';
-                checkbox.checked = state.selected.has(item.id);
-                checkbox.onchange = (e) => {
-                    if (e.target.checked) {
-                        state.selected.add(item.id);
-                    } else {
-                        state.selected.delete(item.id);
-                    }
-                    renderList();
-                };
-
-                const content = document.createElement('div');
-                content.style.flex = '1';
-
-                const title = document.createElement('div');
-                title.textContent = item.title || 'Untitled Conversation';
-                title.style.fontWeight = 'bold';
-                title.style.fontSize = '14px';
-
-                const meta = document.createElement('div');
-                meta.style.fontSize = '12px';
-                meta.style.color = '#666';
-                const timeLabelPrefix = state.timeField === 'create' ? '创建' : '更新';
-                const timeValue = state.timeField === 'create' ? item.create_time : item.update_time;
-                const timeLabel = formatTimestamp(timeValue) || '未知';
-                meta.textContent = `${timeLabelPrefix}: ${timeLabel}`;
-
-                const tags = document.createElement('div');
-                tags.style.marginTop = '6px';
-                tags.style.display = 'flex';
-                tags.style.gap = '6px';
-                tags.style.flexWrap = 'wrap';
-
-                if (item.projectTitle) {
-                    const projectTag = document.createElement('span');
-                    projectTag.textContent = `项目: ${item.projectTitle}`;
-                    Object.assign(projectTag.style, {
-                        background: '#eef2ff', color: '#4338ca',
-                        padding: '2px 6px', borderRadius: '999px', fontSize: '11px'
-                    });
-                    tags.appendChild(projectTag);
-                }
-
-                if (item.is_archived) {
-                    const archivedTag = document.createElement('span');
-                    archivedTag.textContent = '已归档';
-                    Object.assign(archivedTag.style, {
-                        background: '#fef3c7', color: '#92400e',
-                        padding: '2px 6px', borderRadius: '999px', fontSize: '11px'
-                    });
-                    tags.appendChild(archivedTag);
-                }
-
-                content.appendChild(title);
-                content.appendChild(meta);
-                if (tags.childNodes.length > 0) content.appendChild(tags);
-
-                label.appendChild(checkbox);
-                label.appendChild(content);
-                listEl.appendChild(label);
-            });
-
-            if (state.filtered.length > state.visibleCount) {
-                const loadMore = document.createElement('button');
-                loadMore.textContent = `加载更多（剩余 ${state.filtered.length - state.visibleCount} 条）`;
-                Object.assign(loadMore.style, {
-                    width: '100%', padding: '8px 12px', border: '1px solid #ccc',
-                    borderRadius: '6px', background: '#fff', cursor: 'pointer'
-                });
-                loadMore.onclick = () => {
-                    state.visibleCount = Math.min(state.visibleCount + state.pageSize, state.filtered.length);
-                    renderList();
-                };
-                listEl.appendChild(loadMore);
-            }
+            if (state.listWarning) statusEl.classList.add('gre-status-warn');
         };
 
-        renderBase();
-        overlay.appendChild(dialog);
-        document.body.appendChild(overlay);
-        overlay.onclick = (e) => { if (e.target === overlay) closeDialog(); };
+        const toggleItem = (index, checked, extendRange) => {
+            const anchor = state.anchorIndex;
+            const useRange = extendRange && anchor !== null && anchor < state.filtered.length;
+            const from = useRange ? Math.min(anchor, index) : index;
+            const to = useRange ? Math.max(anchor, index) : index;
+            for (let i = from; i <= to; i++) {
+                const id = state.filtered[i].id;
+                if (checked) state.selected.add(id);
+                else state.selected.delete(id);
+            }
+            state.anchorIndex = index;
+            refreshSelection();
+        };
+
+        const renderRow = (item, index) => {
+            const row = document.createElement('div');
+            row.className = 'gre-item';
+            row.dataset.id = item.id;
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.setAttribute('aria-label', item.title || 'Untitled Conversation');
+            checkbox.addEventListener('click', e => {
+                e.stopPropagation();
+                toggleItem(index, checkbox.checked, e.shiftKey);
+            });
+            row.addEventListener('click', e => toggleItem(index, !state.selected.has(item.id), e.shiftKey));
+
+            const content = document.createElement('div');
+            const title = document.createElement('div');
+            title.className = 'gre-item-title';
+            title.textContent = item.title || 'Untitled Conversation';
+            const meta = document.createElement('div');
+            meta.className = 'gre-item-meta';
+            const time = document.createElement('span');
+            time.className = 'gre-muted';
+            const timeValue = state.timeField === 'create' ? item.create_time : item.update_time;
+            time.textContent = `${state.timeField === 'create' ? '创建' : '更新'}：${formatTimestamp(timeValue) || '未知'}`;
+            meta.appendChild(time);
+            if (item.projectTitle) {
+                const tag = document.createElement('span');
+                tag.className = 'gre-tag';
+                tag.textContent = `项目：${item.projectTitle}`;
+                meta.appendChild(tag);
+            }
+            if (item.is_archived) {
+                const tag = document.createElement('span');
+                tag.className = 'gre-tag gre-tag-warn';
+                tag.textContent = '已归档';
+                meta.appendChild(tag);
+            }
+            content.append(title, meta);
+            row.append(checkbox, content);
+            return row;
+        };
+
+        const renderList = () => {
+            const scrollTop = listEl.scrollTop;
+            listEl.innerHTML = '';
+            if (!state.loading && !state.loadError) {
+                if (state.filtered.length === 0) {
+                    const empty = document.createElement('div');
+                    empty.className = 'gre-empty';
+                    empty.textContent = state.list.length === 0 ? '这个空间里没有对话。' : '没有匹配的对话。';
+                    listEl.appendChild(empty);
+                }
+                state.filtered.slice(0, state.visibleCount).forEach((item, index) => listEl.appendChild(renderRow(item, index)));
+                if (state.filtered.length > state.visibleCount) {
+                    const more = document.createElement('button');
+                    more.type = 'button';
+                    more.className = 'gre-btn gre-more';
+                    more.textContent = `加载更多（剩余 ${state.filtered.length - state.visibleCount} 条）`;
+                    more.onclick = () => {
+                        state.visibleCount = Math.min(state.visibleCount + state.pageSize, state.filtered.length);
+                        renderList();
+                    };
+                    listEl.appendChild(more);
+                }
+            }
+            listEl.scrollTop = scrollTop;
+            refreshSelection();
+        };
 
         (async () => {
-            if (!await ensureAccessToken({ silent: true })) {
-                throw new Error('无法获取 Access Token。请刷新页面或打开任意一个对话后再试。');
-            }
+            if (!await ensureAccessToken()) throw new Error(ACCESS_TOKEN_HINT);
             return collectConversationEntries({ mode, accountId: resolveWorkspaceId(workspaceId), session: listSession });
         })()
             .then(({ entries, problems }) => {
@@ -1992,234 +2194,161 @@ html.dark #gre-fab-status {
                 applyFilters();
                 renderList();
             });
+        $('#conv-search').focus();
     }
 
-    /**
-     * [重构] 多步骤、用户主导的导出对话框
-     */
     function showExportDialog(options = {}) {
         if (document.getElementById('export-dialog-overlay')) return;
 
-        const overlay = document.createElement('div');
-        overlay.id = 'export-dialog-overlay';
-        Object.assign(overlay.style, {
-            position: 'fixed', top: '0', left: '0', width: '100%', height: '100%',
-            backgroundColor: 'rgba(0, 0, 0, 0.5)', zIndex: '99998',
-            display: 'flex', alignItems: 'center', justifyContent: 'center'
-        });
-
-        const dialog = document.createElement('div');
-        dialog.id = 'export-dialog';
-        Object.assign(dialog.style, {
-            background: '#fff', padding: '24px', borderRadius: '12px',
-            boxShadow: '0 5px 15px rgba(0,0,0,.3)', width: '450px',
-            fontFamily: 'sans-serif', color: '#333', boxSizing: 'border-box'
-        });
-
-        const closeDialog = () => document.body.removeChild(overlay);
-
-        let pendingTeamAction = null;
         let includeAttachments = Boolean(options.includeAttachments);
         let incremental = Boolean(options.incremental);
         const exportOptions = () => ({ includeAttachments, incremental });
-        const renderStep = (step, action = null) => {
-            pendingTeamAction = action;
-            let html = '';
-            switch (step) {
-                case 'team': {
-                    const detectedIds = detectAllWorkspaceIds();
-                    html = `<h2 style="margin-top:0; margin-bottom: 20px; font-size: 18px;">导出团队空间</h2>`;
+        const { dialog, close: closeDialog } = openModal({ labelledBy: 'gre-dialog-title', onRequestClose: () => closeDialog() });
 
-                    if (detectedIds.length > 1) {
-                        html += `<div style="background: #eef2ff; border: 1px solid #818cf8; border-radius: 8px; padding: 12px; margin-bottom: 20px;">
-                                     <p style="margin: 0 0 12px 0; font-weight: bold; color: #4338ca;">🔎 检测到多个 Workspace，请选择一个:</p>
-                                     <div id="workspace-id-list">`;
-                        detectedIds.forEach((id, index) => {
-                            html += `<label style="display: block; margin-bottom: 8px; padding: 8px; border-radius: 6px; cursor: pointer; border: 1px solid #ddd; background: #fff;">
-                                         <input type="radio" name="workspace_id" value="${id}" ${index === 0 ? 'checked' : ''}>
-                                         <code style="margin-left: 8px; font-family: monospace; color: #555;">${id}</code>
-                                      </label>`;
-                        });
-                        html += `</div></div>`;
-                    } else if (detectedIds.length === 1) {
-                        html += `<div style="background: #f0fdf4; border: 1px solid #4ade80; border-radius: 8px; padding: 12px; margin-bottom: 20px;">
-                                     <p style="margin: 0 0 8px 0; font-weight: bold; color: #166534;">✅ 已自动检测到 Workspace ID:</p>
-                                     <code id="workspace-id-code" style="background: #e0e7ff; padding: 4px 8px; border-radius: 4px; font-family: monospace; color: #4338ca; word-break: break-all;">${detectedIds[0]}</code>
-                                   </div>`;
-                    } else {
-                        html += `<div style="background: #fffbeb; border: 1px solid #facc15; border-radius: 8px; padding: 12px; margin-bottom: 20px;">
-                                     <p style="margin: 0; color: #92400e;">⚠️ 未能自动检测到 Workspace ID。</p>
-                                     <p style="margin: 8px 0 0 0; font-size: 12px; color: #92400e;">请尝试刷新页面或打开一个团队对话，或在下方手动输入。</p>
-                                   </div>
-                                   <label for="team-id-input" style="display: block; margin-bottom: 8px; font-weight: bold;">手动输入 Team Workspace ID:</label>
-                                   <input type="text" id="team-id-input" placeholder="粘贴您的 Workspace ID (ws-...)" style="width: 100%; padding: 8px; border-radius: 6px; border: 1px solid #ccc; box-sizing: border-box;">`;
-                    }
+        const spaceCard = (key, title, description) => `
+            <div class="gre-card">
+                <strong>${title}</strong>
+                <p>${description}</p>
+                <div class="gre-row">
+                    <button id="select-${key}-btn" class="gre-btn gre-btn-primary" type="button">导出全部</button>
+                    <button id="select-${key}-picker-btn" class="gre-btn" type="button">选择对话导出</button>
+                </div>
+            </div>`;
 
-                    let actionButtons = '';
-                    if (pendingTeamAction === 'all') {
-                        actionButtons = `<button id="start-team-export-btn" style="padding: 10px 16px; border: none; border-radius: 8px; background: #10a37f; color: #fff; cursor: pointer; font-weight: bold;">导出全部 (ZIP)</button>`;
-                    } else if (pendingTeamAction === 'select') {
-                        actionButtons = `<button id="start-team-picker-btn" style="padding: 10px 16px; border: 1px solid #ccc; border-radius: 8px; background: #fff; cursor: pointer;">选择对话导出</button>`;
-                    } else {
-                        actionButtons = `<button id="start-team-export-btn" style="padding: 10px 16px; border: none; border-radius: 8px; background: #10a37f; color: #fff; cursor: pointer; font-weight: bold;">导出全部 (ZIP)</button>
-                                     <button id="start-team-picker-btn" style="padding: 10px 16px; border: 1px solid #ccc; border-radius: 8px; background: #fff; cursor: pointer;">选择对话导出</button>`;
-                    }
+        const renderInitial = () => {
+            dialog.innerHTML = `
+                <div class="gre-header">
+                    <h2 id="gre-dialog-title">导出 ChatGPT 对话</h2>
+                    <span class="gre-muted">v${EXPORTER_VERSION}</span>
+                </div>
+                <div class="gre-stack">
+                    ${spaceCard('personal', '个人空间', '个人账户下的全部对话，包括项目中的对话。')}
+                    ${spaceCard('project', '项目空间', '只导出项目中的对话，按项目分文件夹。')}
+                    ${spaceCard('team', '团队空间', '团队（Team / Business）工作区的对话，会自动检测工作区 ID。')}
+                </div>
+                <div class="gre-stack gre-section">
+                    <label class="gre-option">
+                        <input id="include-attachments" type="checkbox" ${includeAttachments ? 'checked' : ''}>
+                        <span>
+                            <strong>同时下载上传和生成的附件</strong>
+                            <span class="gre-muted">开启后导出时间和 ZIP 体积可能明显增加。</span>
+                        </span>
+                    </label>
+                    <label class="gre-option">
+                        <input id="incremental-export" type="checkbox" ${incremental ? 'checked' : ''}>
+                        <span>
+                            <strong>增量导出：只导出有变化的对话</strong>
+                            <span class="gre-muted">仅对“导出全部”生效，跳过上次导出后没有更新的对话。导出记录保存在当前浏览器。</span>
+                        </span>
+                    </label>
+                </div>
+                <div class="gre-spread gre-footer">
+                    <button id="clear-history-btn" class="gre-link" type="button">清除导出记录</button>
+                    <button id="cancel-btn" class="gre-btn" type="button">取消</button>
+                </div>`;
 
-                    html += `<div style="display: flex; justify-content: space-between; align-items: center; margin-top: 24px;">
-                                 <button id="back-btn" style="padding: 10px 16px; border: 1px solid #ccc; border-radius: 8px; background: #fff; cursor: pointer;">返回</button>
-                                 <div style="display: flex; gap: 8px;">
-                                     ${actionButtons}
-                                 </div>
-                               </div>`;
-                    break;
+            const $ = selector => dialog.querySelector(selector);
+            $('#include-attachments').onchange = e => { includeAttachments = e.target.checked; };
+            $('#incremental-export').onchange = e => { incremental = e.target.checked; };
+            $('#clear-history-btn').onclick = e => {
+                if (!confirm('清除后，下一次增量导出会重新导出全部对话。确定清除吗？')) return;
+                clearExportHistory();
+                e.target.textContent = '已清除导出记录';
+                e.target.disabled = true;
+            };
+            $('#select-personal-btn').onclick = () => {
+                closeDialog();
+                startExportProcess('personal', null, exportOptions());
+            };
+            $('#select-personal-picker-btn').onclick = () => {
+                closeDialog();
+                showConversationPicker({ mode: 'personal', workspaceId: null, includeAttachments, incremental });
+            };
+            $('#select-project-btn').onclick = () => {
+                closeDialog();
+                startExportProcess('project', null, exportOptions());
+            };
+            $('#select-project-picker-btn').onclick = () => {
+                closeDialog();
+                showConversationPicker({ mode: 'project', workspaceId: null, includeAttachments, incremental });
+            };
+            $('#select-team-btn').onclick = () => startTeamFlow('all');
+            $('#select-team-picker-btn').onclick = () => startTeamFlow('select');
+            $('#cancel-btn').onclick = closeDialog;
+            $('#select-personal-btn').focus();
+        };
+
+        const runTeamAction = (action, workspaceId) => {
+            closeDialog();
+            if (action === 'all') {
+                startExportProcess('team', workspaceId, exportOptions());
+            } else {
+                showConversationPicker({ mode: 'team', workspaceId, includeAttachments, incremental });
+            }
+        };
+
+        const startTeamFlow = action => {
+            const detectedIds = detectAllWorkspaceIds();
+            if (detectedIds.length === 1) {
+                runTeamAction(action, detectedIds[0]);
+                return;
+            }
+            renderTeam(action, detectedIds);
+        };
+
+        const renderTeam = (action, detectedIds) => {
+            let detection;
+            if (detectedIds.length > 1) {
+                detection = `
+                    <div class="gre-notice gre-notice-info">
+                        <p>检测到多个工作区，请选择一个：</p>
+                        ${detectedIds.map((id, index) => `
+                            <label class="gre-radio">
+                                <input type="radio" name="workspace_id" value="${escapeHtml(id)}" ${index === 0 ? 'checked' : ''}>
+                                <span class="gre-code">${escapeHtml(id)}</span>
+                            </label>`).join('')}
+                    </div>`;
+            } else {
+                detection = `
+                    <div class="gre-notice gre-notice-warn">
+                        <p>未能自动检测到工作区 ID</p>
+                        请刷新页面或打开一个团队对话后重试，也可以在下方手动输入。
+                    </div>
+                    <label for="team-id-input" class="gre-section" style="display: block; margin-bottom: 6px; font-weight: 600;">手动输入工作区 ID</label>
+                    <input id="team-id-input" class="gre-input" type="text" placeholder="粘贴工作区 ID（ws-… 或 UUID）" style="width: 100%;">`;
+            }
+            const actionLabel = action === 'all' ? '导出全部' : '选择对话导出';
+            dialog.innerHTML = `
+                <div class="gre-header"><h2 id="gre-dialog-title">导出团队空间</h2></div>
+                ${detection}
+                <div id="team-id-error" class="gre-error" role="alert" style="margin-top: 8px;" hidden></div>
+                <div class="gre-spread gre-footer">
+                    <button id="back-btn" class="gre-btn" type="button">返回</button>
+                    <button id="start-team-btn" class="gre-btn gre-btn-primary" type="button">${actionLabel}</button>
+                </div>`;
+
+            const readSelectedWorkspaceId = () => {
+                const radio = dialog.querySelector('input[name="workspace_id"]:checked');
+                if (radio) return radio.value;
+                return dialog.querySelector('#team-id-input')?.value.trim() || '';
+            };
+            dialog.querySelector('#back-btn').onclick = renderInitial;
+            dialog.querySelector('#start-team-btn').onclick = () => {
+                const workspaceId = readSelectedWorkspaceId();
+                if (!workspaceId) {
+                    const errorEl = dialog.querySelector('#team-id-error');
+                    errorEl.textContent = '请选择或输入一个工作区 ID。';
+                    errorEl.hidden = false;
+                    dialog.querySelector('#team-id-input')?.focus();
+                    return;
                 }
-
-                case 'initial':
-                default:
-                    html = `<h2 style="margin-top:0; margin-bottom: 20px; font-size: 18px;">选择要导出的空间</h2>
-                                <div style="display: flex; flex-direction: column; gap: 16px;">
-                                    <div style="padding: 16px; border: 1px solid #ccc; border-radius: 8px; background: #f9fafb;">
-                                        <strong style="font-size: 16px;">个人空间</strong>
-                                        <p style="margin: 4px 0 12px 0; color: #666;">导出您个人账户下的对话。</p>
-                                        <div style="display: flex; gap: 8px;">
-                                            <button id="select-personal-btn" style="padding: 8px 12px; border: none; border-radius: 6px; background: #10a37f; color: #fff; cursor: pointer; font-weight: bold;">导出全部</button>
-                                            <button id="select-personal-picker-btn" style="padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer;">选择对话导出</button>
-                                        </div>
-                                    </div>
-                                    <div style="padding: 16px; border: 1px solid #ccc; border-radius: 8px; background: #f9fafb;">
-                                        <strong style="font-size: 16px;">项目空间</strong>
-                                        <p style="margin: 4px 0 12px 0; color: #666;">导出项目空间下的对话，将按项目自动分组。</p>
-                                        <div style="display: flex; gap: 8px;">
-                                            <button id="select-project-btn" style="padding: 8px 12px; border: none; border-radius: 6px; background: #10a37f; color: #fff; cursor: pointer; font-weight: bold;">导出全部</button>
-                                            <button id="select-project-picker-btn" style="padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer;">选择对话导出</button>
-                                        </div>
-                                    </div>
-                                    <div style="padding: 16px; border: 1px solid #ccc; border-radius: 8px; background: #f9fafb;">
-                                        <strong style="font-size: 16px;">团队空间</strong>
-                                        <p style="margin: 4px 0 12px 0; color: #666;">导出团队空间下的对话，将自动检测ID。</p>
-                                        <div style="display: flex; gap: 8px;">
-                                            <button id="select-team-btn" style="padding: 8px 12px; border: none; border-radius: 6px; background: #10a37f; color: #fff; cursor: pointer; font-weight: bold;">导出全部</button>
-                                            <button id="select-team-picker-btn" style="padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer;">选择对话导出</button>
-                                        </div>
-                                    </div>
-                                </div>
-                                <label style="display: flex; align-items: flex-start; gap: 8px; margin-top: 16px; padding: 12px; border: 1px solid #d1d5db; border-radius: 8px; background: #f9fafb; cursor: pointer;">
-                                    <input id="include-attachments" type="checkbox" ${includeAttachments ? 'checked' : ''} style="margin-top: 2px;">
-                                    <span>
-                                        <strong style="display: block; font-size: 13px;">同时下载上传和生成的附件</strong>
-                                        <span style="display: block; margin-top: 2px; color: #666; font-size: 12px;">默认关闭；开启后导出时间和 ZIP 体积可能明显增加。</span>
-                                    </span>
-                                </label>
-                                <label style="display: flex; align-items: flex-start; gap: 8px; margin-top: 8px; padding: 12px; border: 1px solid #d1d5db; border-radius: 8px; background: #f9fafb; cursor: pointer;">
-                                    <input id="incremental-export" type="checkbox" ${incremental ? 'checked' : ''} style="margin-top: 2px;">
-                                    <span>
-                                        <strong style="display: block; font-size: 13px;">增量导出：只导出有变化的对话</strong>
-                                        <span style="display: block; margin-top: 2px; color: #666; font-size: 12px;">仅对“导出全部”生效，跳过上次导出后没有更新的对话。导出记录保存在当前浏览器。</span>
-                                        <button id="clear-history-btn" type="button" style="margin-top: 6px; padding: 0; border: none; background: none; color: #2563eb; cursor: pointer; font-size: 12px;">清除导出记录</button>
-                                    </span>
-                                </label>
-                                <div style="display: flex; justify-content: flex-end; margin-top: 24px;">
-                                    <button id="cancel-btn" style="padding: 10px 16px; border: 1px solid #ccc; border-radius: 8px; background: #fff; cursor: pointer;">取消</button>
-                                </div>`;
-                    break;
-            }
-            dialog.innerHTML = html;
-            attachListeners(step);
+                runTeamAction(action, workspaceId);
+            };
+            (dialog.querySelector('#team-id-input') || dialog.querySelector('#start-team-btn')).focus();
         };
 
-        const attachListeners = (step) => {
-            if (step === 'initial') {
-                const includeAttachmentsInput = document.getElementById('include-attachments');
-                includeAttachmentsInput.onchange = (event) => {
-                    includeAttachments = event.target.checked;
-                };
-                document.getElementById('incremental-export').onchange = (event) => {
-                    incremental = event.target.checked;
-                };
-                document.getElementById('clear-history-btn').onclick = (event) => {
-                    event.preventDefault();
-                    if (!confirm('清除后，下一次增量导出会重新导出全部对话。确定清除吗？')) return;
-                    clearExportHistory();
-                    event.target.textContent = '已清除导出记录';
-                };
-                document.getElementById('select-personal-btn').onclick = () => {
-                    closeDialog();
-                    startExportProcess('personal', null, exportOptions());
-                };
-                document.getElementById('select-personal-picker-btn').onclick = () => {
-                    closeDialog();
-                    showConversationPicker({ mode: 'personal', workspaceId: null, includeAttachments, incremental });
-                };
-                document.getElementById('select-project-btn').onclick = () => {
-                    closeDialog();
-                    startExportProcess('project', null, exportOptions());
-                };
-                document.getElementById('select-project-picker-btn').onclick = () => {
-                    closeDialog();
-                    showConversationPicker({ mode: 'project', workspaceId: null, includeAttachments, incremental });
-                };
-                const startTeamFlow = (action) => {
-                    const detectedIds = detectAllWorkspaceIds();
-                    if (detectedIds.length === 1) {
-                        const workspaceId = detectedIds[0];
-                        closeDialog();
-                        if (action === 'all') {
-                            startExportProcess('team', workspaceId, exportOptions());
-                        } else {
-                            showConversationPicker({ mode: 'team', workspaceId, includeAttachments, incremental });
-                        }
-                        return;
-                    }
-                    renderStep('team', action);
-                };
-                document.getElementById('select-team-btn').onclick = () => startTeamFlow('all');
-                document.getElementById('select-team-picker-btn').onclick = () => startTeamFlow('select');
-                document.getElementById('cancel-btn').onclick = closeDialog;
-            } else if (step === 'team') {
-                document.getElementById('back-btn').onclick = () => renderStep('initial');
-                const readSelectedWorkspaceId = () => {
-                    let workspaceId = '';
-                    const radioChecked = document.querySelector('input[name="workspace_id"]:checked');
-                    const codeEl = document.getElementById('workspace-id-code');
-                    const inputEl = document.getElementById('team-id-input');
-
-                    if (radioChecked) {
-                        workspaceId = radioChecked.value;
-                    } else if (codeEl) {
-                        workspaceId = codeEl.textContent;
-                    } else if (inputEl) {
-                        workspaceId = inputEl.value.trim();
-                    }
-
-                    if (!workspaceId) {
-                        alert('请选择或输入一个有效的 Team Workspace ID！');
-                        return;
-                    }
-                    return workspaceId;
-                };
-                const exportAllBtn = document.getElementById('start-team-export-btn');
-                const pickerBtn = document.getElementById('start-team-picker-btn');
-                if (exportAllBtn) exportAllBtn.onclick = () => {
-                    const workspaceId = readSelectedWorkspaceId();
-                    if (!workspaceId) return;
-                    closeDialog();
-                    startExportProcess('team', workspaceId, exportOptions());
-                };
-                if (pickerBtn) pickerBtn.onclick = () => {
-                    const workspaceId = readSelectedWorkspaceId();
-                    if (!workspaceId) return;
-                    closeDialog();
-                    showConversationPicker({ mode: 'team', workspaceId, includeAttachments, incremental });
-                };
-            }
-        };
-
-        overlay.appendChild(dialog);
-        document.body.appendChild(overlay);
-        overlay.onclick = (e) => { if (e.target === overlay) closeDialog(); };
-        renderStep('initial');
+        renderInitial();
     }
-
     // --- 脚本启动 ---
     // Chrome 扩展版不常驻悬浮按钮（入口是工具栏弹窗），构建时会去掉这一段；
     // 扩展里的按钮只在导出时由 getExportButton() 按需创建，用作进度指示。

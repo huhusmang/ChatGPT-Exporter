@@ -5,11 +5,11 @@ import { FakeChatGPT, loadExporter, makeConversation, waitFor } from './helpers/
 async function exportSelected(env, ids) {
     env.window.ChatGPTExporter.showDialog();
     env.click('#select-personal-picker-btn');
-    await waitFor(() => env.$$('#conv-list input[type="checkbox"]').length > 0, { message: '对话列表加载' });
+    await waitFor(() => env.$$('#conv-list .gre-item').length > 0, { message: '对话列表加载' });
     if (ids) {
         // 列表按更新时间倒序，按标题匹配勾选
-        for (const label of env.$$('#conv-list label')) {
-            if (ids.some(id => label.textContent.includes(`Title ${id}`))) label.querySelector('input').click();
+        for (const row of env.$$('#conv-list .gre-item')) {
+            if (ids.some(id => row.textContent.includes(`Title ${id}`))) row.querySelector('input').click();
         }
     } else {
         env.click('#select-all-btn');

@@ -145,6 +145,19 @@ export async function waitFor(predicate, { timeout = 10000, message = 'condition
     }
 }
 
+// 等待第 count 次导出结果出现在右下角的任务面板中。
+export async function waitForResult(env, count = 1) {
+    const panel = await waitFor(() => {
+        const el = env.$('#gre-task-panel');
+        return el && Number(el.dataset.resultSeq) >= count && el;
+    }, { message: `第 ${count} 次导出结果` });
+    return {
+        tone: panel.dataset.tone,
+        title: panel.querySelector('.gre-task-title').textContent,
+        message: panel.querySelector('.gre-task-body').textContent
+    };
+}
+
 export function loadExporter({ api = new FakeChatGPT(), extension = false } = {}) {
     const virtualConsole = new VirtualConsole();
     const logs = [];

@@ -723,22 +723,33 @@
         }, 2500);
     }
 
+    // 进度文本以 "(n/total)" 结尾。导出时 n 是正在处理的第几个，所以完成比例按 n - 1 计算；打包时 n 就是百分比。
+    function parseProgress(text) {
+        const match = /\s*\((\d+)\s*\/\s*(\d+)\)\s*$/.exec(text);
+        if (!match || Number(match[2]) <= 0) return null;
+        const current = Number(match[1]);
+        const total = Number(match[2]);
+        const packing = text.startsWith('正在打包');
+        const finished = packing ? current : Math.max(0, current - 1);
+        return { current, total, packing, label: text.slice(0, match.index), pct: Math.min(100, Math.round((finished / total) * 100)) };
+    }
+
     // tone 为 'done' / 'error' 时显示结束状态，否则根据文本中的 (n/total) 显示进度环。
     function setFabStatus(btn, text, tone = null) {
         btn.classList.remove('gre-busy', 'gre-progress', 'gre-done', 'gre-error');
         const ring = btn.querySelector('.gre-fab-ring');
         const badge = btn.querySelector('.gre-fab-badge');
-        const pill = fabStatusEl();
+        // 进度和结果的文字由右下角任务面板显示，悬浮球只保留进度环和状态标记。
+        document.getElementById('gre-fab-status')?.classList.remove('gre-visible');
         if (text === EXPORT_BUTTON_LABEL) {
             if (badge) badge.textContent = '';
-            pill.classList.remove('gre-visible');
             btn.title = `ChatGPT Exporter v${EXPORTER_VERSION} · 点击导出 · 拖动移动 · 右键重置位置`;
             fabScheduleCollapse(btn);
             return;
         }
-        const progress = tone ? null : /\((\d+)\s*\/\s*(\d+)\)\s*$/.exec(text);
-        if (progress && Number(progress[2]) > 0) {
-            const pct = Math.min(100, Math.round((Number(progress[1]) / Number(progress[2])) * 100));
+        const progress = tone ? null : parseProgress(text);
+        if (progress) {
+            const { pct } = progress;
             btn.classList.add('gre-progress');
             if (ring) ring.style.setProperty('--gre-pct', String(pct));
             if (badge) badge.textContent = `${pct}%`;
@@ -754,9 +765,6 @@
         }
         btn.title = `${text} · ChatGPT Exporter v${EXPORTER_VERSION}`;
         fabExpand(btn);
-        pill.textContent = text;
-        pill.classList.add('gre-visible');
-        fabPositionStatus(btn);
     }
 
     function ensureFabStyle() {
@@ -970,7 +978,7 @@ html.dark #gre-fab-status {
                 return;
             }
             if (activeExport) {
-                requestCancelActiveExport();
+                highlightTaskPanel();
                 return;
             }
             showExportDialog();
@@ -1056,12 +1064,6 @@ html.dark #gre-fab-status {
         if (!activeExport || activeExport.cancelled) return;
         activeExport.cancelled = true;
         activeExport.progress('正在停止…');
-    }
-
-    function requestCancelActiveExport() {
-        if (!activeExport || activeExport.cancelled) return;
-        if (!confirm('要停止当前导出吗？已经导出的对话会照常打包下载。')) return;
-        cancelActiveExport();
     }
 
     // JSON 是无损备份，必须最先写入；附件或 Markdown 出错只降级为部分成功，不影响已写入的 JSON。
@@ -1889,6 +1891,8 @@ html.dark .gre-seg button[aria-checked="true"] { background: var(--gre-elev); }
     position: fixed; right: 16px; bottom: 16px; z-index: 99999; width: min(340px, calc(100vw - 32px));
     padding: 14px 16px; border: 1px solid var(--gre-line); border-radius: 14px; background: var(--gre-bg); box-shadow: var(--gre-shadow);
 }
+#gre-task-panel.gre-attention { animation: gre-attention .45s ease 2; }
+@keyframes gre-attention { 50% { box-shadow: 0 0 0 3px var(--gre-ink), var(--gre-shadow); } }
 .gre-task-head { display: flex; align-items: center; gap: 8px; min-height: 22px; }
 .gre-task-title { font-weight: 600; }
 #gre-task-panel[data-tone="error"] .gre-task-title { color: var(--gre-danger); }
@@ -2067,20 +2071,27 @@ html.dark .gre-seg button[aria-checked="true"] { background: var(--gre-elev); }
         return panel;
     }
 
+    function highlightTaskPanel() {
+        const panel = document.getElementById('gre-task-panel');
+        if (!panel) return;
+        panel.classList.remove('gre-attention');
+        void panel.offsetWidth; // 重新触发动画
+        panel.classList.add('gre-attention');
+        panel.addEventListener('animationend', () => panel.classList.remove('gre-attention'), { once: true });
+    }
+
     function showTaskProgress(text) {
         const panel = taskPanelEl();
         panel.dataset.state = 'progress';
         panel.dataset.tone = 'info';
-        const match = /\s*\((\d+)\s*\/\s*(\d+)\)\s*$/.exec(text);
-        const done = match ? Number(match[1]) : 0;
-        const total = match ? Number(match[2]) : 0;
+        const progress = parseProgress(text);
         const packing = text.startsWith('正在打包');
         panel.querySelector('.gre-task-title').textContent = packing ? '正在打包' : '正在导出';
-        panel.querySelector('.gre-task-count').textContent = !match ? '' : packing ? `${done}%` : `${done} / ${total}`;
-        panel.querySelector('.gre-task-body').textContent = match ? text.slice(0, match.index) : text;
+        panel.querySelector('.gre-task-count').textContent = !progress ? '' : packing ? `${progress.current}%` : `${progress.current} / ${progress.total}`;
+        panel.querySelector('.gre-task-body').textContent = progress ? progress.label : text;
         const bar = panel.querySelector('.gre-progress-bar');
-        bar.hidden = !match || total === 0;
-        if (total > 0) bar.firstElementChild.style.width = `${Math.min(100, (done / total) * 100)}%`;
+        bar.hidden = !progress;
+        if (progress) bar.firstElementChild.style.width = `${progress.pct}%`;
         panel.querySelector('.gre-task-actions').hidden = false;
         const stop = panel.querySelector('.gre-task-stop');
         stop.disabled = Boolean(activeExport?.cancelled);

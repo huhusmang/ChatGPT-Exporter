@@ -112,6 +112,7 @@ test('导出期间显示进度面板，可以从面板停止导出', async () =>
     const panel = env.$('#gre-task-panel');
     assert.equal(panel.dataset.state, 'progress');
     assert.equal(panel.querySelector('.gre-task-count').textContent, '2 / 3');
+    assert.equal(panel.querySelector('.gre-progress-bar > span').style.width, '33%', '进度只计算已完成的对话');
     env.click('#gre-task-panel .gre-task-stop');
     assert.equal(env.confirms.length, 0, '面板上的停止按钮不需要二次确认');
     release();

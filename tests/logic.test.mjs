@@ -143,7 +143,7 @@ test('导出进行中不能再启动第二个导出', async () => {
     env.close();
 });
 
-test('点击悬浮球可以取消导出，已完成的对话照常打包', async () => {
+test('停止导出后已完成的对话照常打包；导出中点击悬浮球只提示面板', async () => {
     let release;
     const gate = new Promise(resolve => { release = resolve; });
     const api = new FakeChatGPT()
@@ -155,7 +155,10 @@ test('点击悬浮球可以取消导出，已完成的对话照常打包', async
     startFullExport(env);
     await waitFor(() => api.detailRequests().includes('b'), { message: '开始请求对话 b' });
     env.click('#gpt-rescue-btn');
-    assert.equal(env.confirms.length, 1);
+    assert.equal(env.confirms.length, 0, '点击悬浮球不应询问是否取消');
+    assert.ok(env.$('#gre-task-panel').classList.contains('gre-attention'));
+    assert.equal(env.$('#gre-fab-status')?.classList.contains('gre-visible') ?? false, false, '导出中不显示文字气泡');
+    env.click('#gre-task-panel .gre-task-stop');
     release();
     const result = await env.readZip();
     assert.ok(result.find(/Title a.*\.json$/));

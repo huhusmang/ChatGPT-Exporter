@@ -708,7 +708,8 @@
         }, 2500);
     }
 
-    function setFabStatus(btn, text) {
+    // tone 为 'done' / 'error' 时显示结束状态，否则根据文本中的 (n/total) 显示进度环。
+    function setFabStatus(btn, text, tone = null) {
         btn.classList.remove('gre-busy', 'gre-progress', 'gre-done', 'gre-error');
         const ring = btn.querySelector('.gre-fab-ring');
         const badge = btn.querySelector('.gre-fab-badge');
@@ -720,16 +721,16 @@
             fabScheduleCollapse(btn);
             return;
         }
-        const progress = /\((\d+)\s*\/\s*(\d+)\)/.exec(text);
+        const progress = tone ? null : /\((\d+)\s*\/\s*(\d+)\)\s*$/.exec(text);
         if (progress && Number(progress[2]) > 0) {
             const pct = Math.min(100, Math.round((Number(progress[1]) / Number(progress[2])) * 100));
             btn.classList.add('gre-progress');
             if (ring) ring.style.setProperty('--gre-pct', String(pct));
             if (badge) badge.textContent = `${pct}%`;
-        } else if (text.includes('✅')) {
+        } else if (tone === 'done') {
             btn.classList.add('gre-done');
             if (badge) badge.textContent = '✓';
-        } else if (text.includes('⚠️')) {
+        } else if (tone === 'error') {
             btn.classList.add('gre-error');
             if (badge) badge.textContent = '!';
         } else {
@@ -1030,7 +1031,7 @@ html.dark #gre-fab-status {
     function cancelActiveExport() {
         if (!activeExport || activeExport.cancelled) return;
         activeExport.cancelled = true;
-        activeExport.progress('⏹ 正在停止…');
+        activeExport.progress('正在停止…');
     }
 
     function requestCancelActiveExport() {
@@ -1224,6 +1225,7 @@ html.dark #gre-fab-status {
         panel.dataset.resultSeq = String(resultSeq);
         panel.querySelector('.gre-task-title').textContent = title;
         panel.querySelector('.gre-task-body').textContent = message;
+        panel.querySelector('.gre-task-count').textContent = '';
         panel.querySelector('.gre-progress-bar').hidden = true;
         panel.querySelector('.gre-task-actions').hidden = true;
         panel.querySelector('.gre-task-close').hidden = false;
@@ -1238,7 +1240,7 @@ html.dark #gre-fab-status {
             incremental = false
         } = options;
         if (activeExport) {
-            showNotice('已有导出任务正在进行。可以在右下角的进度面板中停止当前导出。');
+            showNotice('已有导出任务正在进行，可以在右下角的面板中停止。');
             return;
         }
         const btn = getExportButton();
@@ -1263,12 +1265,12 @@ html.dark #gre-fab-status {
             failed: 0,
             conversations: []
         } : null;
-        let finalStatus = '⚠️ Error';
+        let finalStatus = ['出错', 'error'];
 
         try {
             let entries = conversationEntries;
             if (!selected) {
-                session.progress('📂 读取对话列表…');
+                session.progress('正在读取对话列表…');
                 const listing = await collectConversationEntries({ mode, accountId, session });
                 listing.problems.forEach(({ folder, error }) => recordExportIssue(errorReport, { folder }, 'list', error));
                 entries = listing.entries;
@@ -1282,7 +1284,7 @@ html.dark #gre-fab-status {
                 entries = changed;
             }
             if (entries.length === 0) {
-                finalStatus = '✅ 完成';
+                finalStatus = ['完成', 'done'];
                 const listProblems = errorReport.issues.length > 0
                     ? `\n另有 ${errorReport.issues.length} 处对话列表获取失败，详情请查看控制台。`
                     : '';
@@ -1301,8 +1303,8 @@ html.dark #gre-fab-status {
                     break;
                 }
                 const entry = entries[i];
-                const label = entry?.title ? entry.title.slice(0, 24) : '对话';
-                session.progress(`📥 ${label} (${i + 1}/${entries.length})`);
+                const label = entry?.title ? entry.title.slice(0, 40) : '对话';
+                session.progress(`${label} (${i + 1}/${entries.length})`);
                 const target = entry?.projectTitle
                     ? zip.folder(sanitizeFilename(entry.projectTitle))
                     : zip;
@@ -1336,7 +1338,7 @@ html.dark #gre-fab-status {
                 const percent = Math.floor(meta.percent);
                 if (percent === lastPercent) return;
                 lastPercent = percent;
-                session.progress(`📦 生成 ZIP 文件 (${percent}/100)`);
+                session.progress(`正在打包 ZIP (${percent}/100)`);
             });
             downloadFile(blob, buildZipFilename({ mode, workspaceId, selected, incremental: incremental && !selected }));
             saveExportHistory(accountId, history, exported);
@@ -1345,11 +1347,11 @@ html.dark #gre-fab-status {
             if (attachmentReport) {
                 summary.message += `\n附件：检测 ${attachmentReport.detected}，成功 ${attachmentReport.downloaded}，失败 ${attachmentReport.failed}。`;
             }
-            finalStatus = hasIssues ? '⚠️ 部分完成' : '✅ 完成';
+            finalStatus = hasIssues ? ['部分完成', 'error'] : ['完成', 'done'];
             showExportResult(summary);
         } catch (error) {
             if (error?.cancelled) {
-                finalStatus = '⚠️ 已取消';
+                finalStatus = ['已取消', 'error'];
                 showExportResult({ tone: 'info', title: '已取消导出', message: '还没有导出任何对话，因此没有生成 ZIP。' });
             } else {
                 console.error('导出过程中发生严重错误:', error);
@@ -1357,7 +1359,7 @@ html.dark #gre-fab-status {
             }
         } finally {
             activeExport = null;
-            setFabStatus(btn, finalStatus);
+            setFabStatus(btn, ...finalStatus);
             setTimeout(() => {
                 if (!activeExport) setFabStatus(btn, EXPORT_BUTTON_LABEL);
             }, 3000);
@@ -1431,7 +1433,7 @@ html.dark #gre-fab-status {
                 const delay = retryAfterMs(response) ?? RATE_LIMIT_RETRY_DELAYS[rateLimitRetries];
                 rateLimitRetries++;
                 if (session) {
-                    await session.wait(delay, seconds => `⏳ 接口限流，${seconds} 秒后重试…`);
+                    await session.wait(delay, seconds => `接口限流，${seconds} 秒后重试…`);
                 } else {
                     await sleep(delay);
                 }
@@ -1535,7 +1537,7 @@ html.dark #gre-fab-status {
                 const sizeBefore = map.size;
                 items.forEach(item => upsertConversationEntry(map, item, { is_archived: isArchived }));
                 offset += items.length;
-                session?.progress(`📂 读取对话列表… 已找到 ${map.size} 个`);
+                session?.progress(`正在读取对话列表，已找到 ${map.size} 个`);
                 // 服务端可能把单页数量压到 PAGE_LIMIT 以下：有 total 时以 total 为准，否则翻到空页为止；
                 // 一页里没有任何新对话时也停止，防止接口忽略 offset 导致死循环。
                 const reachedEnd = items.length === 0
@@ -1583,7 +1585,7 @@ html.dark #gre-fab-status {
 
         let projects = [];
         try {
-            session?.progress('🔍 读取项目列表…');
+            session?.progress('正在读取项目列表…');
             const query = mode === 'team' ? {} : { conversationsPerGizmo: PROJECT_SIDEBAR_PREVIEW, ownedOnly: true };
             projects = await listProjects(accountId, session, query);
         } catch (error) {
@@ -1592,7 +1594,7 @@ html.dark #gre-fab-status {
         }
 
         for (const project of projects) {
-            session?.progress(`📂 读取项目「${project.title}」… 已找到 ${map.size} 个`);
+            session?.progress(`正在读取项目「${project.title}」，已找到 ${map.size} 个`);
             try {
                 const warning = await listProjectConversations(map, project, accountId, session);
                 if (warning) problems.push({ folder: project.title, error: warning });
@@ -1661,124 +1663,215 @@ html.dark #gre-fab-status {
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
     })[ch]);
 
-    // 跟随 ChatGPT 页面的 html.dark 切换深色；所有颜色都走 CSS 变量，避免被页面样式覆盖。
+    const ICONS = {
+        close: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+        chevron: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>',
+        check: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>',
+        search: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>'
+    };
+
+    // ChatGPT 页面的全局样式会重置原生 checkbox / select 的外观，所以这里的勾选框、开关和下拉框都自己绘制。
+    // 颜色跟随页面的 html.dark；只用中性色加一个墨色强调，和 ChatGPT 自身的界面保持一致。
     function ensureUiStyle() {
         if (document.getElementById('gre-ui-style')) return;
         const style = document.createElement('style');
         style.id = 'gre-ui-style';
         style.textContent = `
 .gre-theme {
-    --gre-bg: #fff; --gre-fg: #0d0d0d; --gre-muted: #6b7280; --gre-border: #e5e7eb; --gre-subtle: #f7f7f8;
-    --gre-accent: #10a37f; --gre-accent-fg: #fff; --gre-danger: #b91c1c; --gre-warn: #92400e; --gre-warn-bg: #fffbeb;
-    --gre-info: #4338ca; --gre-info-bg: #eef2ff; --gre-ok: #166534; --gre-ok-bg: #f0fdf4;
-    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-    font-size: 14px; line-height: 1.45; color: var(--gre-fg); color-scheme: light;
+    --gre-bg: #fff; --gre-elev: #fff; --gre-fg: #0d0d0d; --gre-muted: #5d5d5d; --gre-faint: #8f8f8f;
+    --gre-line: rgba(13, 13, 13, .1); --gre-line-strong: rgba(13, 13, 13, .2); --gre-hover: rgba(13, 13, 13, .05);
+    --gre-ink: #0d0d0d; --gre-ink-fg: #fff; --gre-danger: #d93025;
+    --gre-shadow: 0 1px 2px rgba(0, 0, 0, .06), 0 10px 30px rgba(0, 0, 0, .12);
+    font-family: ui-sans-serif, -apple-system, system-ui, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 14px; line-height: 1.5; color: var(--gre-fg); color-scheme: light;
+    -webkit-font-smoothing: antialiased;
 }
 html.dark .gre-theme {
-    --gre-bg: #212121; --gre-fg: #ececec; --gre-muted: #a1a1aa; --gre-border: #3f3f46; --gre-subtle: #2a2a2a;
-    --gre-accent: #19c37d; --gre-accent-fg: #0d0d0d; --gre-danger: #f87171; --gre-warn: #fbbf24; --gre-warn-bg: rgba(251, 191, 36, .1);
-    --gre-info: #a5b4fc; --gre-info-bg: rgba(99, 102, 241, .16); --gre-ok: #86efac; --gre-ok-bg: rgba(34, 197, 94, .12);
+    --gre-bg: #2f2f2f; --gre-elev: #383838; --gre-fg: #ececec; --gre-muted: #b4b4b4; --gre-faint: #8e8e8e;
+    --gre-line: rgba(255, 255, 255, .1); --gre-line-strong: rgba(255, 255, 255, .22); --gre-hover: rgba(255, 255, 255, .07);
+    --gre-ink: #ececec; --gre-ink-fg: #0d0d0d; --gre-danger: #ff7b72;
+    --gre-shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 12px 32px rgba(0, 0, 0, .45);
     color-scheme: dark;
 }
 .gre-theme *, .gre-theme *::before, .gre-theme *::after { box-sizing: border-box; }
+.gre-theme [hidden] { display: none !important; }
+/* :where() 不增加优先级，组件自己的 class 规则才能覆盖这些基础样式 */
+:where(.gre-theme) button { margin: 0; font: inherit; color: inherit; }
+:where(.gre-theme) svg { display: block; flex: none; }
+.gre-theme :focus-visible { outline: 2px solid var(--gre-ink); outline-offset: 2px; }
+.gre-theme .gre-input:focus-visible { outline: none; }
+
 .gre-overlay {
     position: fixed; inset: 0; z-index: 99998; padding: 16px;
-    display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, .45);
+    display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, .4);
 }
+html.dark .gre-overlay { background: rgba(0, 0, 0, .6); }
 .gre-dialog {
-    width: 100%; max-width: 460px; max-height: calc(100vh - 32px); overflow: auto; padding: 22px;
-    background: var(--gre-bg); border-radius: 14px; box-shadow: 0 12px 40px rgba(0, 0, 0, .3);
+    position: relative; display: flex; flex-direction: column; width: 100%; max-width: 400px;
+    max-height: calc(100vh - 32px); background: var(--gre-bg); border-radius: 16px; box-shadow: var(--gre-shadow);
 }
-.gre-dialog.gre-wide { max-width: 760px; display: flex; flex-direction: column; }
-.gre-dialog h2 { margin: 0; font-size: 18px; font-weight: 600; }
-.gre-header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
-.gre-muted { color: var(--gre-muted); font-size: 12px; }
-.gre-stack { display: flex; flex-direction: column; gap: 10px; }
-.gre-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.gre-spread { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
-.gre-section { margin-top: 14px; }
-.gre-footer { margin-top: 18px; }
-.gre-card { padding: 14px 16px; border: 1px solid var(--gre-border); border-radius: 10px; background: var(--gre-subtle); }
-.gre-card strong { font-size: 15px; }
-.gre-card p { margin: 2px 0 10px; color: var(--gre-muted); font-size: 13px; }
+html.dark .gre-dialog { box-shadow: var(--gre-shadow), inset 0 0 0 1px var(--gre-line); }
+.gre-dialog.gre-wide { max-width: 680px; height: min(760px, calc(100vh - 32px)); }
+.gre-head { display: flex; align-items: center; gap: 10px; padding: 18px 20px 14px; }
+.gre-head h2 { margin: 0; font-size: 17px; font-weight: 600; line-height: 1.3; color: var(--gre-fg); }
+.gre-sub { color: var(--gre-faint); font-size: 13px; }
+.gre-icon-btn {
+    display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; margin: -6px -8px -6px auto;
+    padding: 0; border: 0; border-radius: 8px; background: transparent; color: var(--gre-muted); cursor: pointer;
+}
+.gre-icon-btn:hover { background: var(--gre-hover); color: var(--gre-fg); }
+.gre-body { padding: 0 20px 4px; }
+.gre-foot { display: flex; align-items: center; gap: 8px; padding: 16px 20px 18px; }
+.gre-foot.gre-divided { border-top: 1px solid var(--gre-line); padding-top: 14px; }
+.gre-spacer { flex: 1; }
+
+.gre-seg { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 2px; padding: 3px; border-radius: 10px; background: var(--gre-hover); }
+.gre-seg button {
+    height: 32px; padding: 0; border: 0; border-radius: 7px; background: transparent;
+    color: var(--gre-muted); font-size: 14px; cursor: pointer; transition: background-color .15s, color .15s;
+}
+.gre-seg button:hover { color: var(--gre-fg); }
+.gre-seg button[aria-checked="true"] { background: var(--gre-bg); color: var(--gre-fg); font-weight: 500; box-shadow: 0 1px 3px rgba(0, 0, 0, .1); }
+html.dark .gre-seg button[aria-checked="true"] { background: var(--gre-elev); }
+
+.gre-rows { margin-top: 10px; }
+.gre-rows > * + * { border-top: 1px solid var(--gre-line); }
+.gre-toggle {
+    display: flex; align-items: center; gap: 12px; width: 100%; padding: 12px 0;
+    border: 0; background: transparent; text-align: left; cursor: pointer;
+}
+.gre-toggle-text { flex: 1; }
+.gre-switch { position: relative; flex: none; width: 32px; height: 20px; border-radius: 999px; background: var(--gre-line-strong); transition: background-color .15s; }
+.gre-switch::after {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
+    background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .25); transition: transform .15s;
+}
+[aria-checked="true"] > .gre-switch { background: var(--gre-ink); }
+[aria-checked="true"] > .gre-switch::after { transform: translateX(12px); background: var(--gre-ink-fg); }
+.gre-foot .gre-toggle { width: auto; padding: 0; flex-direction: row-reverse; gap: 8px; color: var(--gre-muted); font-size: 13px; }
+.gre-field { display: flex; align-items: center; gap: 12px; padding: 12px 0 0; }
+.gre-field-label { color: var(--gre-muted); flex: none; }
+.gre-field .gre-dd, .gre-field .gre-input { flex: 1; min-width: 0; }
+.gre-field .gre-chip { width: 100%; min-width: 0; justify-content: space-between; }
+.gre-field .gre-chip > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.gre-dialog:focus { outline: none; }
+.gre-history { padding: 0 0 8px; }
+
 .gre-btn {
-    padding: 7px 14px; border: 1px solid var(--gre-border); border-radius: 8px; background: var(--gre-bg);
-    color: var(--gre-fg); font: inherit; font-size: 13px; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center; height: 36px; padding: 0 16px;
+    border: 1px solid var(--gre-line-strong); border-radius: 999px; background: transparent;
+    color: var(--gre-fg); font-size: 14px; font-weight: 500; white-space: nowrap; cursor: pointer;
+    transition: background-color .15s, opacity .15s;
 }
-.gre-btn:hover:not(:disabled) { background: var(--gre-subtle); }
-.gre-btn:disabled { opacity: .5; cursor: not-allowed; }
-.gre-btn-primary { background: var(--gre-accent); border-color: var(--gre-accent); color: var(--gre-accent-fg); font-weight: 600; }
-.gre-btn-primary:hover:not(:disabled) { background: var(--gre-accent); filter: brightness(1.08); }
-.gre-link { padding: 0; border: none; background: none; color: var(--gre-info); font: inherit; font-size: 12px; cursor: pointer; }
-.gre-link:hover { text-decoration: underline; }
-.gre-theme :focus-visible { outline: 2px solid var(--gre-accent); outline-offset: 1px; }
-.gre-option {
-    display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; cursor: pointer;
-    border: 1px solid var(--gre-border); border-radius: 10px; background: var(--gre-subtle);
+.gre-btn:hover:not(:disabled) { background: var(--gre-hover); }
+.gre-btn:disabled { opacity: .35; cursor: default; }
+.gre-btn-primary { border-color: transparent; background: var(--gre-ink); color: var(--gre-ink-fg); }
+.gre-btn-primary:hover:not(:disabled) { background: var(--gre-ink); opacity: .85; }
+.gre-btn-ghost { border-color: transparent; }
+.gre-link {
+    padding: 0; border: 0; background: transparent; color: var(--gre-muted); font-size: 13px; cursor: pointer;
+    text-decoration: underline; text-decoration-color: var(--gre-line-strong); text-underline-offset: 3px;
 }
-.gre-option input { margin-top: 3px; accent-color: var(--gre-accent); }
-.gre-option strong { display: block; font-size: 13px; font-weight: 600; }
+.gre-link:hover:not(:disabled) { color: var(--gre-fg); }
+.gre-link:disabled { text-decoration: none; cursor: default; }
+
 .gre-input {
-    padding: 7px 9px; border: 1px solid var(--gre-border); border-radius: 8px; background: var(--gre-bg);
-    color: var(--gre-fg); font: inherit; font-size: 13px; min-width: 0;
+    height: 36px; padding: 0 12px; border: 1px solid var(--gre-line-strong); border-radius: 10px; outline: none;
+    background: transparent; color: var(--gre-fg); font: inherit; font-size: 14px; min-width: 0;
 }
-.gre-grow { flex: 1 1 200px; }
-.gre-filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
-.gre-notice { padding: 12px; border-radius: 10px; font-size: 13px; }
-.gre-notice p { margin: 0 0 8px; font-weight: 600; }
-.gre-notice-info { background: var(--gre-info-bg); color: var(--gre-info); }
-.gre-notice-ok { background: var(--gre-ok-bg); color: var(--gre-ok); }
-.gre-notice-warn { background: var(--gre-warn-bg); color: var(--gre-warn); }
-.gre-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-all; }
-.gre-radio { display: flex; align-items: center; gap: 8px; padding: 8px; margin-top: 6px; border-radius: 8px; background: var(--gre-bg); color: var(--gre-fg); cursor: pointer; }
-.gre-error { color: var(--gre-danger); font-size: 12px; }
-.gre-list {
-    flex: 1 1 auto; min-height: 160px; max-height: min(420px, 50vh); overflow: auto;
-    margin-top: 8px; padding: 4px; border: 1px solid var(--gre-border); border-radius: 10px;
+.gre-input:focus { border-color: var(--gre-ink); }
+.gre-input::placeholder { color: var(--gre-faint); }
+.gre-search { position: relative; display: flex; align-items: center; margin: 0; }
+.gre-search svg { position: absolute; left: 12px; color: var(--gre-faint); pointer-events: none; }
+.gre-search .gre-input { width: 100%; padding-left: 36px; }
+
+.gre-filters { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.gre-dd { position: relative; }
+.gre-chip {
+    display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 8px 0 12px;
+    border: 1px solid var(--gre-line-strong); border-radius: 999px; background: transparent;
+    color: var(--gre-fg); font-size: 13px; white-space: nowrap; cursor: pointer; transition: background-color .15s, border-color .15s;
 }
-.gre-item { display: flex; gap: 10px; align-items: flex-start; padding: 8px 10px; border-radius: 8px; cursor: pointer; user-select: none; -webkit-user-select: none; }
-.gre-item:hover { background: var(--gre-subtle); }
-.gre-item.gre-checked { background: var(--gre-info-bg); }
-.gre-item input { margin-top: 3px; accent-color: var(--gre-accent); }
-.gre-item-title { font-weight: 600; word-break: break-word; }
-.gre-item-meta { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 2px; }
-.gre-tag { padding: 1px 7px; border-radius: 999px; font-size: 11px; background: var(--gre-info-bg); color: var(--gre-info); }
-.gre-tag-warn { background: var(--gre-warn-bg); color: var(--gre-warn); }
-.gre-empty { padding: 12px 8px; color: var(--gre-muted); }
-.gre-more { width: 100%; margin-top: 4px; }
-#conv-status.gre-status-error { color: var(--gre-danger); }
-#conv-status.gre-status-warn { color: var(--gre-warn); }
+.gre-chip-k { color: var(--gre-muted); }
+.gre-chip svg { color: var(--gre-faint); }
+.gre-chip:hover, .gre-chip[aria-expanded="true"] { background: var(--gre-hover); }
+.gre-chip[data-active="true"] { border-color: var(--gre-ink); }
+.gre-menu {
+    position: absolute; top: calc(100% + 4px); left: 0; z-index: 5; min-width: 100%; padding: 4px;
+    border: 1px solid var(--gre-line); border-radius: 12px; background: var(--gre-elev); box-shadow: var(--gre-shadow);
+}
+.gre-menu button {
+    display: flex; align-items: center; gap: 16px; width: 100%; height: 32px; padding: 0 10px;
+    border: 0; border-radius: 8px; background: transparent; font-size: 13px; text-align: left; white-space: nowrap; cursor: pointer;
+}
+.gre-menu button:hover, .gre-menu button:focus-visible { background: var(--gre-hover); outline: none; }
+.gre-menu button svg { margin-left: auto; visibility: hidden; }
+.gre-menu button[aria-checked="true"] svg { visibility: visible; }
+.gre-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.gre-range { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.gre-range .gre-input { height: 32px; font-size: 13px; }
+
+.gre-listhead { display: flex; align-items: center; gap: 12px; margin-top: 14px; padding: 10px 20px; border-top: 1px solid var(--gre-line); border-bottom: 1px solid var(--gre-line); }
+.gre-selectall { display: inline-flex; align-items: center; gap: 12px; padding: 0; border: 0; background: transparent; font-size: 13px; font-weight: 500; cursor: pointer; }
+.gre-selectall:disabled { opacity: .4; cursor: default; }
+.gre-count { color: var(--gre-muted); font-size: 13px; }
+.gre-count.gre-error { color: var(--gre-danger); }
+.gre-listhead .gre-link { margin-left: auto; }
+.gre-list { flex: 1; min-height: 120px; overflow: auto; padding: 4px 8px; }
+.gre-item { display: flex; align-items: center; gap: 12px; padding: 9px 12px; border-radius: 10px; cursor: pointer; user-select: none; -webkit-user-select: none; }
+.gre-item:hover { background: var(--gre-hover); }
+.gre-item:focus-visible { outline-offset: -2px; }
+.gre-item-main { flex: 1; min-width: 0; }
+.gre-item-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gre-item-meta { margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--gre-faint); font-size: 12px; }
+.gre-item-date { flex: none; color: var(--gre-faint); font-size: 12px; font-variant-numeric: tabular-nums; }
+.gre-box {
+    display: inline-flex; align-items: center; justify-content: center; flex: none; width: 18px; height: 18px;
+    border: 1.5px solid var(--gre-faint); border-radius: 5px; color: var(--gre-ink-fg);
+    transition: background-color .12s, border-color .12s;
+}
+[aria-checked="true"] > .gre-box, [aria-checked="mixed"] > .gre-box { background: var(--gre-ink); border-color: var(--gre-ink); }
+.gre-box svg, .gre-box i { display: none; }
+[aria-checked="true"] > .gre-box svg { display: block; }
+[aria-checked="mixed"] > .gre-box i { display: block; width: 8px; height: 2px; border-radius: 1px; background: currentColor; }
+.gre-empty { padding: 48px 12px; text-align: center; color: var(--gre-faint); }
+.gre-more { display: flex; margin: 8px auto; height: 30px; font-size: 13px; }
+.gre-error { color: var(--gre-danger); font-size: 13px; }
 
 #gre-task-panel {
-    position: fixed; right: 16px; bottom: 16px; z-index: 99999; width: min(360px, calc(100vw - 32px));
-    padding: 14px 16px; border: 1px solid var(--gre-border); border-left: 4px solid var(--gre-info);
-    border-radius: 12px; background: var(--gre-bg); box-shadow: 0 8px 30px rgba(0, 0, 0, .25);
+    position: fixed; right: 16px; bottom: 16px; z-index: 99999; width: min(340px, calc(100vw - 32px));
+    padding: 14px 16px; border: 1px solid var(--gre-line); border-radius: 14px; background: var(--gre-bg); box-shadow: var(--gre-shadow);
 }
-#gre-task-panel[data-tone="ok"] { border-left-color: var(--gre-accent); }
-#gre-task-panel[data-tone="warn"] { border-left-color: var(--gre-warn); }
-#gre-task-panel[data-tone="error"] { border-left-color: var(--gre-danger); }
-.gre-task-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 4px; }
+.gre-task-head { display: flex; align-items: center; gap: 8px; min-height: 22px; }
 .gre-task-title { font-weight: 600; }
-.gre-task-body { max-height: 40vh; overflow: auto; font-size: 13px; white-space: pre-wrap; word-break: break-word; }
-.gre-task-close { padding: 0 4px; border: none; background: none; color: var(--gre-muted); font-size: 18px; line-height: 1; cursor: pointer; }
-.gre-progress-bar { height: 4px; margin-top: 10px; overflow: hidden; border-radius: 999px; background: var(--gre-border); }
-.gre-progress-bar > span { display: block; width: 0; height: 100%; background: var(--gre-accent); transition: width .2s; }
-.gre-task-actions { display: flex; justify-content: flex-end; margin-top: 10px; }
+#gre-task-panel[data-tone="error"] .gre-task-title { color: var(--gre-danger); }
+.gre-task-count { margin-left: auto; color: var(--gre-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.gre-task-close { width: 28px; height: 28px; }
+.gre-task-body { margin-top: 2px; max-height: 40vh; overflow: auto; color: var(--gre-muted); font-size: 13px; white-space: pre-wrap; word-break: break-word; }
+.gre-progress-bar { height: 4px; margin-top: 12px; overflow: hidden; border-radius: 999px; background: var(--gre-hover); }
+.gre-progress-bar > span { display: block; width: 0; height: 100%; border-radius: inherit; background: var(--gre-ink); transition: width .2s; }
+.gre-task-actions { display: flex; justify-content: flex-end; margin-top: 12px; }
+.gre-task-actions .gre-btn { height: 30px; padding: 0 14px; font-size: 13px; }
 #gre-toast {
     position: fixed; left: 50%; bottom: 24px; z-index: 100000; max-width: calc(100vw - 32px); transform: translateX(-50%);
-    padding: 10px 16px; border: 1px solid var(--gre-border); border-radius: 10px;
-    background: var(--gre-bg); box-shadow: 0 8px 24px rgba(0, 0, 0, .2);
+    padding: 10px 16px; border-radius: 12px; background: var(--gre-ink); color: var(--gre-ink-fg); font-size: 13px; box-shadow: var(--gre-shadow);
 }
-.gre-theme [hidden] { display: none !important; }
 @media (max-width: 560px) {
-    .gre-dialog { padding: 16px; }
-    .gre-list { max-height: 45vh; }
+    .gre-dialog.gre-wide { height: calc(100vh - 32px); }
+    .gre-item-date { display: none; }
 }
 `;
         document.head.appendChild(style);
     }
 
-    // 只有在遮罩上按下并松开才算点击遮罩，避免在弹窗里拖选文字时误关。
+    let activeMenu = null;
+    function closeActiveMenu() {
+        if (!activeMenu) return false;
+        activeMenu.close();
+        return true;
+    }
+
+    // 只有在遮罩上按下并松开才算点击遮罩，避免在弹窗里拖选文字时误关；Esc 先关闭展开的下拉菜单。
     function openModal({ wide = false, labelledBy = null, onRequestClose }) {
         ensureUiStyle();
         const existing = document.getElementById('export-dialog-overlay');
@@ -1804,16 +1897,103 @@ html.dark .gre-theme {
         const onKeydown = e => {
             if (e.key !== 'Escape') return;
             e.stopPropagation();
-            onRequestClose();
+            if (!closeActiveMenu()) onRequestClose();
         };
         document.addEventListener('keydown', onKeydown, true);
         const close = () => {
+            closeActiveMenu();
             document.removeEventListener('keydown', onKeydown, true);
             overlay.remove();
         };
         overlay.__greClose = close;
         document.body.appendChild(overlay);
         return { overlay, dialog, close };
+    }
+
+    function createDropdown({ id, label, options, value, onChange, renderValue = null }) {
+        const wrap = document.createElement('div');
+        wrap.className = 'gre-dd';
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.id = id;
+        chip.className = 'gre-chip';
+        chip.setAttribute('aria-haspopup', 'menu');
+        chip.setAttribute('aria-expanded', 'false');
+        const menu = document.createElement('div');
+        menu.className = 'gre-menu';
+        menu.setAttribute('role', 'menu');
+        wrap.appendChild(chip);
+
+        let current = value;
+        const labelText = () => (typeof label === 'function' ? label() : label);
+        const render = () => {
+            const option = options.find(item => item.value === current) || options[0];
+            const valueHtml = renderValue ? renderValue(option) : escapeHtml(option.label);
+            const key = labelText();
+            chip.innerHTML = `${key ? `<span class="gre-chip-k">${escapeHtml(key)}</span>` : ''}<span>${valueHtml}</span>${ICONS.chevron}`;
+            chip.dataset.active = String(Boolean(key) && current !== options[0].value);
+        };
+        const onOutside = e => { if (!wrap.contains(e.target)) api.close(); };
+        const api = {
+            el: wrap,
+            get value() { return current; },
+            refresh: render,
+            close() {
+                menu.remove();
+                chip.setAttribute('aria-expanded', 'false');
+                document.removeEventListener('mousedown', onOutside, true);
+                if (activeMenu === api) activeMenu = null;
+            }
+        };
+        const open = () => {
+            closeActiveMenu();
+            menu.innerHTML = '';
+            options.forEach(option => {
+                const item = document.createElement('button');
+                item.type = 'button';
+                item.setAttribute('role', 'menuitemradio');
+                item.setAttribute('aria-checked', String(option.value === current));
+                item.dataset.value = option.value;
+                item.innerHTML = `<span>${renderValue ? renderValue(option) : escapeHtml(option.label)}</span>${ICONS.check}`;
+                item.onclick = () => {
+                    api.close();
+                    chip.focus();
+                    if (option.value === current) return;
+                    current = option.value;
+                    render();
+                    onChange(current);
+                };
+                menu.appendChild(item);
+            });
+            menu.onkeydown = e => {
+                if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+                e.preventDefault();
+                const items = [...menu.children];
+                const index = items.indexOf(document.activeElement);
+                items[(index + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length].focus();
+            };
+            wrap.appendChild(menu);
+            chip.setAttribute('aria-expanded', 'true');
+            document.addEventListener('mousedown', onOutside, true);
+            activeMenu = api;
+            (menu.querySelector('[aria-checked="true"]') || menu.firstElementChild)?.focus();
+        };
+        chip.onclick = () => (activeMenu === api ? api.close() : open());
+        render();
+        return api;
+    }
+
+    const toggleHtml = (id, text, on) => `
+        <button type="button" id="${id}" class="gre-toggle" role="switch" aria-checked="${on ? 'true' : 'false'}">
+            <span class="gre-toggle-text">${text}</span><span class="gre-switch"></span>
+        </button>`;
+
+    function bindToggle(el, onChange) {
+        el.onclick = () => {
+            const next = el.getAttribute('aria-checked') !== 'true';
+            el.setAttribute('aria-checked', String(next));
+            onChange(next);
+        };
     }
 
     function taskPanelEl() {
@@ -1828,11 +2008,12 @@ html.dark .gre-theme {
         panel.innerHTML = `
             <div class="gre-task-head">
                 <span class="gre-task-title"></span>
-                <button type="button" class="gre-task-close" aria-label="关闭" hidden>×</button>
+                <span class="gre-task-count"></span>
+                <button type="button" class="gre-icon-btn gre-task-close" aria-label="关闭" hidden>${ICONS.close}</button>
             </div>
             <div class="gre-task-body"></div>
             <div class="gre-progress-bar" hidden><span></span></div>
-            <div class="gre-task-actions" hidden><button type="button" class="gre-btn gre-task-stop">停止导出</button></div>`;
+            <div class="gre-task-actions" hidden><button type="button" class="gre-btn gre-task-stop">停止</button></div>`;
         panel.querySelector('.gre-task-close').onclick = () => panel.remove();
         panel.querySelector('.gre-task-stop').onclick = cancelActiveExport;
         document.body.appendChild(panel);
@@ -1843,18 +2024,20 @@ html.dark .gre-theme {
         const panel = taskPanelEl();
         panel.dataset.state = 'progress';
         panel.dataset.tone = 'info';
-        panel.querySelector('.gre-task-title').textContent = '正在导出';
-        panel.querySelector('.gre-task-body').textContent = text;
-        const match = /\((\d+)\s*\/\s*(\d+)\)/.exec(text);
+        const match = /\s*\((\d+)\s*\/\s*(\d+)\)\s*$/.exec(text);
+        const done = match ? Number(match[1]) : 0;
+        const total = match ? Number(match[2]) : 0;
+        const packing = text.startsWith('正在打包');
+        panel.querySelector('.gre-task-title').textContent = packing ? '正在打包' : '正在导出';
+        panel.querySelector('.gre-task-count').textContent = !match ? '' : packing ? `${done}%` : `${done} / ${total}`;
+        panel.querySelector('.gre-task-body').textContent = match ? text.slice(0, match.index) : text;
         const bar = panel.querySelector('.gre-progress-bar');
-        bar.hidden = !match;
-        if (match && Number(match[2]) > 0) {
-            bar.firstElementChild.style.width = `${Math.min(100, (Number(match[1]) / Number(match[2])) * 100)}%`;
-        }
+        bar.hidden = !match || total === 0;
+        if (total > 0) bar.firstElementChild.style.width = `${Math.min(100, (done / total) * 100)}%`;
         panel.querySelector('.gre-task-actions').hidden = false;
         const stop = panel.querySelector('.gre-task-stop');
         stop.disabled = Boolean(activeExport?.cancelled);
-        stop.textContent = activeExport?.cancelled ? '正在停止…' : '停止导出';
+        stop.textContent = activeExport?.cancelled ? '正在停止…' : '停止';
         panel.querySelector('.gre-task-close').hidden = true;
     }
 
@@ -1875,6 +2058,10 @@ html.dark .gre-theme {
     }
 
     const SPACE_LABELS = { personal: '个人空间', project: '项目空间', team: '团队空间' };
+    const formatDate = value => {
+        const seconds = normalizeEpochSeconds(value);
+        return seconds ? new Date(seconds * 1000).toLocaleDateString() : '';
+    };
 
     function showConversationPicker(options = {}) {
         const { mode = 'personal', workspaceId = null, includeAttachments = false, incremental = false } = options;
@@ -1887,20 +2074,21 @@ html.dark .gre-theme {
             selected: new Set(),
             anchorIndex: null,
             query: '',
-            scope: mode === 'project' ? 'project' : 'all',
-            scopeLocked: mode === 'project',
+            sort: 'update-desc',
+            scope: 'all',
             archived: 'all',
-            timeField: 'update',
-            pageSize: 100,
-            visibleCount: 100,
+            timeRange: 'all',
             startDate: '',
             endDate: '',
+            pageSize: 100,
+            visibleCount: 100,
             includeAttachments: Boolean(includeAttachments)
         };
+        const timeField = () => (state.sort.startsWith('create') ? 'create_time' : 'update_time');
+
         // 关闭选择器时停止仍在进行的列表加载，避免关闭后继续请求接口。
         const listSession = createTaskSession(text => {
-            const statusEl = dialog.querySelector('#conv-status');
-            if (state.loading && statusEl) statusEl.textContent = text;
+            if (state.loading) statusEl.textContent = text;
         });
         const closeDialog = () => {
             listSession.cancelled = true;
@@ -1914,52 +2102,35 @@ html.dark .gre-theme {
         const { dialog } = modal;
 
         dialog.innerHTML = `
-            <div class="gre-header">
-                <h2 id="gre-picker-title">选择要导出的对话</h2>
-                <span class="gre-muted">${SPACE_LABELS[mode] || SPACE_LABELS.personal}${workspaceId ? `（<span class="gre-code">${escapeHtml(workspaceId)}</span>）` : ''}</span>
+            <div class="gre-head">
+                <h2 id="gre-picker-title">选择对话</h2>
+                <span class="gre-sub">${SPACE_LABELS[mode] || SPACE_LABELS.personal}</span>
+                <button type="button" id="gre-close-btn" class="gre-icon-btn" aria-label="关闭">${ICONS.close}</button>
             </div>
-            <div class="gre-filters">
-                <input id="conv-search" class="gre-input gre-grow" type="search" placeholder="搜索标题、项目名或 ID" aria-label="搜索对话">
-                <select id="filter-scope" class="gre-input" aria-label="范围">
-                    <option value="all">全部范围</option>
-                    <option value="project">仅项目</option>
-                    <option value="root">仅项目外</option>
-                </select>
-                <select id="filter-archived" class="gre-input" aria-label="归档状态">
-                    <option value="all">全部状态</option>
-                    <option value="active">仅未归档</option>
-                    <option value="archived">仅已归档</option>
-                </select>
-            </div>
-            <div class="gre-filters">
-                <select id="filter-time-field" class="gre-input" aria-label="时间字段">
-                    <option value="update">按更新时间</option>
-                    <option value="create">按创建时间</option>
-                </select>
-                <input id="filter-start-date" class="gre-input" type="date" aria-label="开始日期">
-                <span class="gre-muted">至</span>
-                <input id="filter-end-date" class="gre-input" type="date" aria-label="结束日期">
-                <button id="clear-date-btn" class="gre-btn" type="button">清空日期</button>
-            </div>
-            <label class="gre-option">
-                <input id="include-attachments-picker" type="checkbox" ${state.includeAttachments ? 'checked' : ''}>
-                <span>
-                    <strong>同时下载上传和生成的附件</strong>
-                    <span class="gre-muted">开启后导出时间和 ZIP 体积可能明显增加。</span>
-                </span>
-            </label>
-            <div class="gre-spread gre-section">
-                <div id="conv-status" class="gre-muted" role="status">正在加载列表…</div>
-                <div class="gre-row">
-                    <button id="select-all-btn" class="gre-btn" type="button" disabled>全选筛选结果</button>
-                    <button id="clear-all-btn" class="gre-btn" type="button" disabled>清空选择</button>
+            <div class="gre-body">
+                <label class="gre-search">${ICONS.search}
+                    <input id="conv-search" class="gre-input" type="search" placeholder="搜索标题、项目或 ID" aria-label="搜索对话" autocomplete="off">
+                </label>
+                <div id="gre-filters" class="gre-filters"></div>
+                <div id="gre-range" class="gre-range" hidden>
+                    <input id="filter-start-date" class="gre-input" type="date" aria-label="开始日期">
+                    <span class="gre-count">至</span>
+                    <input id="filter-end-date" class="gre-input" type="date" aria-label="结束日期">
                 </div>
             </div>
-            <div id="conv-list" class="gre-list" aria-labelledby="gre-picker-title"></div>
-            <div class="gre-muted" style="margin-top: 6px;">按住 Shift 点击可以连续选择多个对话。</div>
-            <div class="gre-spread gre-footer">
-                <button id="back-btn" class="gre-btn" type="button">返回</button>
-                <button id="export-selected-btn" class="gre-btn gre-btn-primary" type="button" disabled>导出选中 (0)</button>
+            <div class="gre-listhead">
+                <button type="button" id="select-all-btn" class="gre-selectall" role="checkbox" aria-checked="false" disabled>
+                    <span class="gre-box">${ICONS.check}<i></i></span>全选
+                </button>
+                <span id="conv-status" class="gre-count" role="status">正在加载…</span>
+                <button type="button" id="clear-all-btn" class="gre-link" hidden>清除选择</button>
+            </div>
+            <div id="conv-list" class="gre-list" role="group" aria-labelledby="gre-picker-title"></div>
+            <div class="gre-foot gre-divided">
+                ${toggleHtml('include-attachments-picker', '包含附件', state.includeAttachments)}
+                <span class="gre-spacer"></span>
+                <button type="button" id="back-btn" class="gre-btn gre-btn-ghost">返回</button>
+                <button type="button" id="export-selected-btn" class="gre-btn gre-btn-primary" disabled>导出</button>
             </div>
         `;
 
@@ -1969,34 +2140,81 @@ html.dark .gre-theme {
         const selectAllBtn = $('#select-all-btn');
         const clearAllBtn = $('#clear-all-btn');
         const exportBtn = $('#export-selected-btn');
-
-        if (state.scopeLocked) {
-            const scopeSelect = $('#filter-scope');
-            scopeSelect.value = 'project';
-            scopeSelect.disabled = true;
-            scopeSelect.title = '项目空间仅包含项目对话';
-        }
+        const rangeEl = $('#gre-range');
 
         const refilter = () => {
             applyFilters();
             renderList();
         };
+        const filtersEl = $('#gre-filters');
+        const timeDropdown = createDropdown({
+            id: 'filter-time',
+            label: () => (timeField() === 'create_time' ? '创建于' : '更新于'),
+            value: 'all',
+            options: [
+                { value: 'all', label: '不限' },
+                { value: '7', label: '最近 7 天' },
+                { value: '30', label: '最近 30 天' },
+                { value: '90', label: '最近 90 天' },
+                { value: 'year', label: '今年' },
+                { value: 'custom', label: '自定义' }
+            ],
+            onChange: value => {
+                state.timeRange = value;
+                rangeEl.hidden = value !== 'custom';
+                refilter();
+            }
+        });
+        const sortDropdown = createDropdown({
+            id: 'filter-sort',
+            label: '排序',
+            value: state.sort,
+            options: [
+                { value: 'update-desc', label: '最近更新' },
+                { value: 'create-desc', label: '最近创建' },
+                { value: 'create-asc', label: '最早创建' }
+            ],
+            onChange: value => {
+                state.sort = value;
+                timeDropdown.refresh();
+                refilter();
+            }
+        });
+        filtersEl.appendChild(sortDropdown.el);
+        if (mode !== 'project') {
+            filtersEl.appendChild(createDropdown({
+                id: 'filter-scope',
+                label: '范围',
+                value: 'all',
+                options: [
+                    { value: 'all', label: '全部' },
+                    { value: 'project', label: '项目内' },
+                    { value: 'root', label: '项目外' }
+                ],
+                onChange: value => { state.scope = value; refilter(); }
+            }).el);
+        }
+        filtersEl.appendChild(createDropdown({
+            id: 'filter-archived',
+            label: '状态',
+            value: 'all',
+            options: [
+                { value: 'all', label: '全部' },
+                { value: 'active', label: '未归档' },
+                { value: 'archived', label: '已归档' }
+            ],
+            onChange: value => { state.archived = value; refilter(); }
+        }).el);
+        filtersEl.appendChild(timeDropdown.el);
+
+        $('#gre-close-btn').onclick = requestClose;
         $('#conv-search').oninput = e => { state.query = e.target.value || ''; refilter(); };
-        $('#filter-scope').onchange = e => { state.scope = e.target.value; refilter(); };
-        $('#filter-archived').onchange = e => { state.archived = e.target.value; refilter(); };
-        $('#filter-time-field').onchange = e => { state.timeField = e.target.value; refilter(); };
         $('#filter-start-date').onchange = e => { state.startDate = e.target.value || ''; refilter(); };
         $('#filter-end-date').onchange = e => { state.endDate = e.target.value || ''; refilter(); };
-        $('#clear-date-btn').onclick = () => {
-            state.startDate = '';
-            state.endDate = '';
-            $('#filter-start-date').value = '';
-            $('#filter-end-date').value = '';
-            refilter();
-        };
-        $('#include-attachments-picker').onchange = e => { state.includeAttachments = e.target.checked; };
+        bindToggle($('#include-attachments-picker'), value => { state.includeAttachments = value; });
         selectAllBtn.onclick = () => {
-            state.filtered.forEach(item => state.selected.add(item.id));
+            const allSelected = state.filtered.length > 0 && state.filtered.every(item => state.selected.has(item.id));
+            state.filtered.forEach(item => (allSelected ? state.selected.delete(item.id) : state.selected.add(item.id)));
             refreshSelection();
         };
         clearAllBtn.onclick = () => {
@@ -2006,7 +2224,7 @@ html.dark .gre-theme {
         };
         $('#back-btn').onclick = () => {
             closeDialog();
-            showExportDialog({ includeAttachments: state.includeAttachments, incremental });
+            showExportDialog({ space: mode, includeAttachments: state.includeAttachments, incremental });
         };
         exportBtn.onclick = async () => {
             if (state.selected.size === 0) return;
@@ -2015,10 +2233,27 @@ html.dark .gre-theme {
             await startSelectiveExportProcess(mode, workspaceId, selectedList, state.includeAttachments);
         };
 
+        const timeBounds = () => {
+            const now = Date.now() / 1000;
+            switch (state.timeRange) {
+                case '7':
+                case '30':
+                case '90':
+                    return [now - Number(state.timeRange) * 86400, null];
+                case 'year':
+                    return [new Date(new Date().getFullYear(), 0, 1).getTime() / 1000, null];
+                case 'custom':
+                    return [parseDateInputToEpoch(state.startDate, false), parseDateInputToEpoch(state.endDate, true)];
+                default:
+                    return [null, null];
+            }
+        };
+
         const applyFilters = () => {
             const query = state.query.trim().toLowerCase();
-            const startBound = parseDateInputToEpoch(state.startDate, false);
-            const endBound = parseDateInputToEpoch(state.endDate, true);
+            const [startBound, endBound] = timeBounds();
+            const field = timeField();
+            const direction = state.sort.endsWith('asc') ? 1 : -1;
             state.filtered = state.list.filter(item => {
                 const text = `${item.title || ''} ${item.projectTitle || ''} ${item.id || ''}`.toLowerCase();
                 if (query && !text.includes(query)) return false;
@@ -2027,13 +2262,13 @@ html.dark .gre-theme {
                 if (state.archived === 'active' && item.is_archived) return false;
                 if (state.archived === 'archived' && !item.is_archived) return false;
                 if (startBound || endBound) {
-                    const ts = normalizeEpochSeconds((state.timeField === 'create' ? item.create_time : item.update_time) || 0);
+                    const ts = normalizeEpochSeconds(item[field] || 0);
                     if (!ts) return false;
                     if (startBound && ts < startBound) return false;
                     if (endBound && ts > endBound) return false;
                 }
                 return true;
-            });
+            }).sort((a, b) => direction * ((normalizeEpochSeconds(a[field]) || 0) - (normalizeEpochSeconds(b[field]) || 0)));
             state.visibleCount = state.pageSize;
             state.anchorIndex = null;
         };
@@ -2041,30 +2276,35 @@ html.dark .gre-theme {
         // 选中状态变化只更新已有行和统计，不重建列表，避免滚动位置跳回顶部。
         const refreshSelection = () => {
             listEl.querySelectorAll('.gre-item').forEach(row => {
-                const checked = state.selected.has(row.dataset.id);
-                row.classList.toggle('gre-checked', checked);
-                row.querySelector('input').checked = checked;
+                row.setAttribute('aria-checked', String(state.selected.has(row.dataset.id)));
             });
             const ready = !state.loading && !state.loadError;
-            selectAllBtn.textContent = `全选筛选结果 (${state.filtered.length})`;
+            const selectedInView = state.filtered.filter(item => state.selected.has(item.id)).length;
             selectAllBtn.disabled = !ready || state.filtered.length === 0;
-            clearAllBtn.disabled = !ready || state.selected.size === 0;
+            selectAllBtn.setAttribute('aria-checked', selectedInView === 0 ? 'false'
+                : selectedInView === state.filtered.length ? 'true' : 'mixed');
+            clearAllBtn.hidden = state.selected.size === 0;
             exportBtn.disabled = !ready || state.selected.size === 0;
-            exportBtn.textContent = `导出选中 (${state.selected.size})`;
+            exportBtn.textContent = state.selected.size > 0 ? `导出 ${state.selected.size} 个` : '导出';
 
-            statusEl.className = 'gre-muted';
+            statusEl.classList.remove('gre-error');
+            statusEl.removeAttribute('title');
             if (state.loading) return;
             if (state.loadError) {
                 statusEl.textContent = `加载失败：${state.loadError}`;
-                statusEl.classList.add('gre-status-error');
+                statusEl.classList.add('gre-error');
                 return;
             }
-            statusEl.textContent = `共 ${state.list.length} 条 · 筛选 ${state.filtered.length} 条 · 已选 ${state.selected.size} 条`
-                + (state.listWarning ? `。⚠️ ${state.listWarning}` : '');
-            if (state.listWarning) statusEl.classList.add('gre-status-warn');
+            const total = state.filtered.length === state.list.length
+                ? `${state.list.length} 个对话`
+                : `${state.filtered.length} / ${state.list.length} 个对话`;
+            const selected = state.selected.size > 0 ? ` · 已选 ${state.selected.size}` : '';
+            statusEl.textContent = total + selected + (state.listWarning ? ' · 部分项目未能读取' : '');
+            if (state.listWarning) statusEl.title = state.listWarning;
         };
 
-        const toggleItem = (index, checked, extendRange) => {
+        const toggleItem = (index, extendRange) => {
+            const checked = !state.selected.has(state.filtered[index].id);
             const anchor = state.anchorIndex;
             const useRange = extendRange && anchor !== null && anchor < state.filtered.length;
             const from = useRange ? Math.min(anchor, index) : index;
@@ -2082,59 +2322,53 @@ html.dark .gre-theme {
             const row = document.createElement('div');
             row.className = 'gre-item';
             row.dataset.id = item.id;
-            const checkbox = document.createElement('input');
-            checkbox.type = 'checkbox';
-            checkbox.setAttribute('aria-label', item.title || 'Untitled Conversation');
-            checkbox.addEventListener('click', e => {
-                e.stopPropagation();
-                toggleItem(index, checkbox.checked, e.shiftKey);
+            row.tabIndex = 0;
+            row.setAttribute('role', 'checkbox');
+            row.setAttribute('aria-checked', String(state.selected.has(item.id)));
+            row.addEventListener('click', e => toggleItem(index, e.shiftKey));
+            row.addEventListener('keydown', e => {
+                if (e.key !== ' ' && e.key !== 'Enter') return;
+                e.preventDefault();
+                toggleItem(index, e.shiftKey);
             });
-            row.addEventListener('click', e => toggleItem(index, !state.selected.has(item.id), e.shiftKey));
 
-            const content = document.createElement('div');
-            const title = document.createElement('div');
-            title.className = 'gre-item-title';
-            title.textContent = item.title || 'Untitled Conversation';
-            const meta = document.createElement('div');
-            meta.className = 'gre-item-meta';
-            const time = document.createElement('span');
-            time.className = 'gre-muted';
-            const timeValue = state.timeField === 'create' ? item.create_time : item.update_time;
-            time.textContent = `${state.timeField === 'create' ? '创建' : '更新'}：${formatTimestamp(timeValue) || '未知'}`;
-            meta.appendChild(time);
-            if (item.projectTitle) {
-                const tag = document.createElement('span');
-                tag.className = 'gre-tag';
-                tag.textContent = `项目：${item.projectTitle}`;
-                meta.appendChild(tag);
-            }
-            if (item.is_archived) {
-                const tag = document.createElement('span');
-                tag.className = 'gre-tag gre-tag-warn';
-                tag.textContent = '已归档';
-                meta.appendChild(tag);
-            }
-            content.append(title, meta);
-            row.append(checkbox, content);
+            const meta = [item.projectTitle, item.is_archived ? '已归档' : null].filter(Boolean).join(' · ');
+            const timeValue = item[timeField()];
+            row.innerHTML = `
+                <span class="gre-box">${ICONS.check}<i></i></span>
+                <div class="gre-item-main">
+                    <div class="gre-item-title"></div>
+                    ${meta ? '<div class="gre-item-meta"></div>' : ''}
+                </div>
+                <span class="gre-item-date"></span>`;
+            row.querySelector('.gre-item-title').textContent = item.title || 'Untitled Conversation';
+            if (meta) row.querySelector('.gre-item-meta').textContent = meta;
+            const date = row.querySelector('.gre-item-date');
+            date.textContent = formatDate(timeValue);
+            date.title = `${timeField() === 'create_time' ? '创建' : '更新'}于 ${formatTimestamp(timeValue) || '未知'}`;
             return row;
         };
 
         const renderList = () => {
             const scrollTop = listEl.scrollTop;
             listEl.innerHTML = '';
-            if (!state.loading && !state.loadError) {
-                if (state.filtered.length === 0) {
-                    const empty = document.createElement('div');
-                    empty.className = 'gre-empty';
-                    empty.textContent = state.list.length === 0 ? '这个空间里没有对话。' : '没有匹配的对话。';
-                    listEl.appendChild(empty);
-                }
+            if (state.loading || state.loadError) {
+                const note = document.createElement('div');
+                note.className = 'gre-empty';
+                note.textContent = state.loading ? '正在加载…' : '对话列表加载失败。';
+                listEl.appendChild(note);
+            } else if (state.filtered.length === 0) {
+                const empty = document.createElement('div');
+                empty.className = 'gre-empty';
+                empty.textContent = state.list.length === 0 ? '这里还没有对话' : '没有匹配的对话';
+                listEl.appendChild(empty);
+            } else {
                 state.filtered.slice(0, state.visibleCount).forEach((item, index) => listEl.appendChild(renderRow(item, index)));
                 if (state.filtered.length > state.visibleCount) {
                     const more = document.createElement('button');
                     more.type = 'button';
                     more.className = 'gre-btn gre-more';
-                    more.textContent = `加载更多（剩余 ${state.filtered.length - state.visibleCount} 条）`;
+                    more.textContent = `再显示 ${Math.min(state.pageSize, state.filtered.length - state.visibleCount)} 个`;
                     more.onclick = () => {
                         state.visibleCount = Math.min(state.visibleCount + state.pageSize, state.filtered.length);
                         renderList();
@@ -2146,6 +2380,7 @@ html.dark .gre-theme {
             refreshSelection();
         };
 
+        renderList();
         (async () => {
             if (!await ensureAccessToken()) throw new Error(ACCESS_TOKEN_HINT);
             return collectConversationEntries({ mode, accountId: resolveWorkspaceId(workspaceId), session: listSession });
@@ -2176,154 +2411,122 @@ html.dark .gre-theme {
     function showExportDialog(options = {}) {
         if (document.getElementById('export-dialog-overlay')) return;
 
+        let space = SPACE_LABELS[options.space] ? options.space : 'personal';
         let includeAttachments = Boolean(options.includeAttachments);
         let incremental = Boolean(options.incremental);
-        const exportOptions = () => ({ includeAttachments, incremental });
+        let teamDropdown = null;
         const { dialog, close: closeDialog } = openModal({ labelledBy: 'gre-dialog-title', onRequestClose: () => closeDialog() });
 
-        const spaceCard = (key, title, description) => `
-            <div class="gre-card">
-                <strong>${title}</strong>
-                <p>${description}</p>
-                <div class="gre-row">
-                    <button id="select-${key}-btn" class="gre-btn gre-btn-primary" type="button">导出全部</button>
-                    <button id="select-${key}-picker-btn" class="gre-btn" type="button">选择对话导出</button>
+        dialog.innerHTML = `
+            <div class="gre-head">
+                <h2 id="gre-dialog-title">导出对话</h2>
+                <button type="button" id="gre-close-btn" class="gre-icon-btn" aria-label="关闭">${ICONS.close}</button>
+            </div>
+            <div class="gre-body">
+                <div class="gre-seg" role="radiogroup" aria-label="导出范围">
+                    <button type="button" role="radio" data-space="personal">个人</button>
+                    <button type="button" role="radio" data-space="project">项目</button>
+                    <button type="button" role="radio" data-space="team">团队</button>
                 </div>
+                <div id="gre-team-field" hidden></div>
+                <div class="gre-rows">
+                    ${toggleHtml('include-attachments', '包含附件', includeAttachments)}
+                    ${toggleHtml('incremental-export', '仅导出有变化的对话', incremental)}
+                </div>
+                <div id="gre-history-row" class="gre-history" hidden>
+                    <button type="button" id="clear-history-btn" class="gre-link">清除导出记录</button>
+                </div>
+            </div>
+            <div class="gre-foot">
+                <span class="gre-spacer"></span>
+                <button type="button" id="open-picker-btn" class="gre-btn">选择对话</button>
+                <button type="button" id="export-all-btn" class="gre-btn gre-btn-primary">导出全部</button>
             </div>`;
 
-        const renderInitial = () => {
-            dialog.innerHTML = `
-                <div class="gre-header">
-                    <h2 id="gre-dialog-title">导出 ChatGPT 对话</h2>
-                    <span class="gre-muted">v${EXPORTER_VERSION}</span>
-                </div>
-                <div class="gre-stack">
-                    ${spaceCard('personal', '个人空间', '个人账户下的全部对话，包括项目中的对话。')}
-                    ${spaceCard('project', '项目空间', '只导出项目中的对话，按项目分文件夹。')}
-                    ${spaceCard('team', '团队空间', '团队（Team / Business）工作区的对话，会自动检测工作区 ID。')}
-                </div>
-                <div class="gre-stack gre-section">
-                    <label class="gre-option">
-                        <input id="include-attachments" type="checkbox" ${includeAttachments ? 'checked' : ''}>
-                        <span>
-                            <strong>同时下载上传和生成的附件</strong>
-                            <span class="gre-muted">开启后导出时间和 ZIP 体积可能明显增加。</span>
-                        </span>
-                    </label>
-                    <label class="gre-option">
-                        <input id="incremental-export" type="checkbox" ${incremental ? 'checked' : ''}>
-                        <span>
-                            <strong>增量导出：只导出有变化的对话</strong>
-                            <span class="gre-muted">仅对“导出全部”生效，跳过上次导出后没有更新的对话。导出记录保存在当前浏览器。</span>
-                        </span>
-                    </label>
-                </div>
-                <div class="gre-spread gre-footer">
-                    <button id="clear-history-btn" class="gre-link" type="button">清除导出记录</button>
-                    <button id="cancel-btn" class="gre-btn" type="button">取消</button>
-                </div>`;
+        const $ = selector => dialog.querySelector(selector);
+        const teamField = $('#gre-team-field');
+        const historyRow = $('#gre-history-row');
 
-            const $ = selector => dialog.querySelector(selector);
-            $('#include-attachments').onchange = e => { includeAttachments = e.target.checked; };
-            $('#incremental-export').onchange = e => { incremental = e.target.checked; };
-            $('#clear-history-btn').onclick = e => {
-                if (!confirm('清除后，下一次增量导出会重新导出全部对话。确定清除吗？')) return;
-                clearExportHistory();
-                e.target.textContent = '已清除导出记录';
-                e.target.disabled = true;
-            };
-            $('#select-personal-btn').onclick = () => {
-                closeDialog();
-                startExportProcess('personal', null, exportOptions());
-            };
-            $('#select-personal-picker-btn').onclick = () => {
-                closeDialog();
-                showConversationPicker({ mode: 'personal', workspaceId: null, includeAttachments, incremental });
-            };
-            $('#select-project-btn').onclick = () => {
-                closeDialog();
-                startExportProcess('project', null, exportOptions());
-            };
-            $('#select-project-picker-btn').onclick = () => {
-                closeDialog();
-                showConversationPicker({ mode: 'project', workspaceId: null, includeAttachments, incremental });
-            };
-            $('#select-team-btn').onclick = () => startTeamFlow('all');
-            $('#select-team-picker-btn').onclick = () => startTeamFlow('select');
-            $('#cancel-btn').onclick = closeDialog;
-            $('#select-personal-btn').focus();
-        };
-
-        const runTeamAction = (action, workspaceId) => {
-            closeDialog();
-            if (action === 'all') {
-                startExportProcess('team', workspaceId, exportOptions());
-            } else {
-                showConversationPicker({ mode: 'team', workspaceId, includeAttachments, incremental });
-            }
-        };
-
-        const startTeamFlow = action => {
+        const renderTeamField = () => {
+            teamDropdown = null;
+            teamField.hidden = space !== 'team';
+            if (space !== 'team') return;
             const detectedIds = detectAllWorkspaceIds();
-            if (detectedIds.length === 1) {
-                runTeamAction(action, detectedIds[0]);
-                return;
-            }
-            renderTeam(action, detectedIds);
-        };
-
-        const renderTeam = (action, detectedIds) => {
-            let detection;
-            if (detectedIds.length > 1) {
-                detection = `
-                    <div class="gre-notice gre-notice-info">
-                        <p>检测到多个工作区，请选择一个：</p>
-                        ${detectedIds.map((id, index) => `
-                            <label class="gre-radio">
-                                <input type="radio" name="workspace_id" value="${escapeHtml(id)}" ${index === 0 ? 'checked' : ''}>
-                                <span class="gre-code">${escapeHtml(id)}</span>
-                            </label>`).join('')}
-                    </div>`;
+            teamField.innerHTML = `
+                <div class="gre-field"><span class="gre-field-label">工作区</span></div>
+                <div id="team-id-error" class="gre-error" role="alert" style="margin-top: 6px;" hidden></div>`;
+            const row = teamField.querySelector('.gre-field');
+            if (detectedIds.length > 0) {
+                teamDropdown = createDropdown({
+                    id: 'team-id-select',
+                    label: '',
+                    value: detectedIds[0],
+                    options: detectedIds.map(id => ({ value: id, label: id })),
+                    renderValue: option => `<span class="gre-mono">${escapeHtml(option.label)}</span>`,
+                    onChange: () => {}
+                });
+                row.appendChild(teamDropdown.el);
             } else {
-                detection = `
-                    <div class="gre-notice gre-notice-warn">
-                        <p>未能自动检测到工作区 ID</p>
-                        请刷新页面或打开一个团队对话后重试，也可以在下方手动输入。
-                    </div>
-                    <label for="team-id-input" class="gre-section" style="display: block; margin-bottom: 6px; font-weight: 600;">手动输入工作区 ID</label>
-                    <input id="team-id-input" class="gre-input" type="text" placeholder="粘贴工作区 ID（ws-… 或 UUID）" style="width: 100%;">`;
+                const input = document.createElement('input');
+                input.id = 'team-id-input';
+                input.className = 'gre-input';
+                input.placeholder = '没有检测到，请粘贴工作区 ID';
+                input.autocomplete = 'off';
+                row.appendChild(input);
             }
-            const actionLabel = action === 'all' ? '导出全部' : '选择对话导出';
-            dialog.innerHTML = `
-                <div class="gre-header"><h2 id="gre-dialog-title">导出团队空间</h2></div>
-                ${detection}
-                <div id="team-id-error" class="gre-error" role="alert" style="margin-top: 8px;" hidden></div>
-                <div class="gre-spread gre-footer">
-                    <button id="back-btn" class="gre-btn" type="button">返回</button>
-                    <button id="start-team-btn" class="gre-btn gre-btn-primary" type="button">${actionLabel}</button>
-                </div>`;
-
-            const readSelectedWorkspaceId = () => {
-                const radio = dialog.querySelector('input[name="workspace_id"]:checked');
-                if (radio) return radio.value;
-                return dialog.querySelector('#team-id-input')?.value.trim() || '';
-            };
-            dialog.querySelector('#back-btn').onclick = renderInitial;
-            dialog.querySelector('#start-team-btn').onclick = () => {
-                const workspaceId = readSelectedWorkspaceId();
-                if (!workspaceId) {
-                    const errorEl = dialog.querySelector('#team-id-error');
-                    errorEl.textContent = '请选择或输入一个工作区 ID。';
-                    errorEl.hidden = false;
-                    dialog.querySelector('#team-id-input')?.focus();
-                    return;
-                }
-                runTeamAction(action, workspaceId);
-            };
-            (dialog.querySelector('#team-id-input') || dialog.querySelector('#start-team-btn')).focus();
         };
 
-        renderInitial();
+        const selectSpace = value => {
+            space = value;
+            dialog.querySelectorAll('[data-space]').forEach(button => {
+                button.setAttribute('aria-checked', String(button.dataset.space === space));
+            });
+            renderTeamField();
+        };
+
+        const readWorkspaceId = () => {
+            if (space !== 'team') return null;
+            const value = teamDropdown ? teamDropdown.value : $('#team-id-input')?.value.trim();
+            if (value) return value;
+            const errorEl = $('#team-id-error');
+            errorEl.textContent = '请填写工作区 ID';
+            errorEl.hidden = false;
+            $('#team-id-input')?.focus();
+            return undefined;
+        };
+
+        dialog.querySelectorAll('[data-space]').forEach(button => {
+            button.onclick = () => selectSpace(button.dataset.space);
+        });
+        bindToggle($('#include-attachments'), value => { includeAttachments = value; });
+        bindToggle($('#incremental-export'), value => {
+            incremental = value;
+            historyRow.hidden = !value;
+        });
+        historyRow.hidden = !incremental;
+        $('#clear-history-btn').onclick = e => {
+            if (!confirm('清除后，下一次增量导出会重新导出全部对话。确定清除吗？')) return;
+            clearExportHistory();
+            e.target.textContent = '导出记录已清除';
+            e.target.disabled = true;
+        };
+        $('#gre-close-btn').onclick = closeDialog;
+        $('#export-all-btn').onclick = () => {
+            const workspaceId = readWorkspaceId();
+            if (workspaceId === undefined) return;
+            closeDialog();
+            startExportProcess(space, workspaceId, { includeAttachments, incremental });
+        };
+        $('#open-picker-btn').onclick = () => {
+            const workspaceId = readWorkspaceId();
+            if (workspaceId === undefined) return;
+            closeDialog();
+            showConversationPicker({ mode: space, workspaceId, includeAttachments, incremental });
+        };
+
+        selectSpace(space);
+        dialog.tabIndex = -1;
+        dialog.focus();
     }
     // --- 脚本启动 ---
     // Chrome 扩展版不常驻悬浮按钮（入口是工具栏弹窗），构建时会去掉这一段；

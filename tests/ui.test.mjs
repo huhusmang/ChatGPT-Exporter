@@ -10,7 +10,7 @@ function sampleApi(count = 5) {
 
 async function openPicker(env) {
     env.window.ChatGPTExporter.showDialog();
-    env.click('#select-personal-picker-btn');
+    env.click('#open-picker-btn');
     await waitFor(() => env.$$('#conv-list .gre-item').length > 0, { message: '对话列表加载' });
 }
 
@@ -30,18 +30,57 @@ test('按 Esc 关闭导出弹窗', () => {
     env.close();
 });
 
-test('选择器支持 Shift 连选，全选按钮显示筛选数量', async () => {
+const checkedRows = env => env.$$('#conv-list .gre-item').map(row => row.getAttribute('aria-checked') === 'true');
+
+test('选择器每行有勾选框，支持 Shift 连选，全选只作用于筛选结果', async () => {
     const env = loadExporter({ api: sampleApi(5) });
     await openPicker(env);
-    assert.equal(env.$('#select-all-btn').textContent, '全选筛选结果 (5)');
+    assert.equal(env.$$('#conv-list .gre-item .gre-box').length, 5);
     clickRow(env, 1);
     clickRow(env, 3, { shiftKey: true });
-    assert.equal(env.$('#export-selected-btn').textContent, '导出选中 (3)');
-    assert.deepEqual(env.$$('#conv-list .gre-item').map(row => row.querySelector('input').checked), [false, true, true, true, false]);
+    assert.equal(env.$('#export-selected-btn').textContent, '导出 3 个');
+    assert.deepEqual(checkedRows(env), [false, true, true, true, false]);
+    assert.equal(env.$('#select-all-btn').getAttribute('aria-checked'), 'mixed');
 
     env.$('#conv-search').value = 'c4';
     env.$('#conv-search').dispatchEvent(new env.window.Event('input'));
-    assert.equal(env.$('#select-all-btn').textContent, '全选筛选结果 (1)');
+    assert.match(env.$('#conv-status').textContent, /1 \/ 5 个对话/);
+    env.click('#select-all-btn');
+    assert.equal(env.$('#select-all-btn').getAttribute('aria-checked'), 'true');
+    assert.equal(env.$('#export-selected-btn').textContent, '导出 4 个');
+    env.click('#select-all-btn');
+    assert.equal(env.$('#export-selected-btn').textContent, '导出 3 个');
+    env.close();
+});
+
+test('可以按创建时间排序', async () => {
+    const api = new FakeChatGPT()
+        .addConversation(makeConversation('old', { updateTime: 1700000000 }))
+        .addConversation(makeConversation('new', { updateTime: 1700009000 }));
+    // old 是最早创建、最近更新的对话
+    api.conversations.get('old').conversation.update_time = 1700099000;
+    const env = loadExporter({ api });
+    await openPicker(env);
+    const titles = () => env.$$('#conv-list .gre-item-title').map(el => el.textContent);
+    assert.deepEqual(titles(), ['Title old', 'Title new']);
+    env.click('#filter-sort');
+    env.click('#export-dialog .gre-menu [data-value="create-desc"]');
+    assert.deepEqual(titles(), ['Title new', 'Title old']);
+    assert.match(env.$('#filter-time').textContent, /创建于/);
+    env.click('#filter-sort');
+    env.click('#export-dialog .gre-menu [data-value="create-asc"]');
+    assert.deepEqual(titles(), ['Title old', 'Title new']);
+    env.close();
+});
+
+test('下拉菜单打开时按 Esc 只关闭菜单', async () => {
+    const env = loadExporter({ api: sampleApi(2) });
+    await openPicker(env);
+    env.click('#filter-archived');
+    assert.ok(env.$('#export-dialog .gre-menu'));
+    key(env, 'Escape');
+    assert.equal(env.$('#export-dialog .gre-menu'), null);
+    assert.ok(env.$('#export-dialog-overlay'));
     env.close();
 });
 
@@ -55,7 +94,7 @@ test('已选对话时点击遮罩或按 Esc 需要确认，取消确认则保留
     overlay.dispatchEvent(new env.window.MouseEvent('click', { bubbles: true }));
     key(env, 'Escape');
     assert.ok(env.$('#export-dialog-overlay'), '取消确认后弹窗应保留');
-    assert.equal(env.$('#export-selected-btn').textContent, '导出选中 (1)');
+    assert.equal(env.$('#export-selected-btn').textContent, '导出 1 个');
     env.window.confirm = () => true;
     key(env, 'Escape');
     assert.equal(env.$('#export-dialog-overlay'), null);
@@ -68,11 +107,11 @@ test('导出期间显示进度面板，可以从面板停止导出', async () =>
     const api = sampleApi(3).route(/\/conversation\/c1$/, async () => { await gate; });
     const env = loadExporter({ api });
     env.window.ChatGPTExporter.showDialog();
-    env.click('#select-personal-btn');
+    env.click('#export-all-btn');
     await waitFor(() => api.detailRequests().includes('c1'), { message: '开始请求 c1' });
     const panel = env.$('#gre-task-panel');
     assert.equal(panel.dataset.state, 'progress');
-    assert.match(panel.querySelector('.gre-task-body').textContent, /\(2\/3\)/);
+    assert.equal(panel.querySelector('.gre-task-count').textContent, '2 / 3');
     env.click('#gre-task-panel .gre-task-stop');
     assert.equal(env.confirms.length, 0, '面板上的停止按钮不需要二次确认');
     release();
@@ -86,7 +125,7 @@ test('导出期间显示进度面板，可以从面板停止导出', async () =>
 test('导出完成后在面板显示结果，不再弹出 alert', async () => {
     const env = loadExporter({ api: sampleApi(2) });
     env.window.ChatGPTExporter.showDialog();
-    env.click('#select-personal-btn');
+    env.click('#export-all-btn');
     const result = await waitForResult(env);
     assert.equal(result.tone, 'ok');
     assert.match(result.message, /共导出 2 个对话/);
@@ -101,7 +140,7 @@ test('Markdown 带 YAML front matter', async () => {
     conversation.title = 'He said "hi"';
     const env = loadExporter({ api: new FakeChatGPT().addConversation(conversation) });
     env.window.ChatGPTExporter.showDialog();
-    env.click('#select-personal-btn');
+    env.click('#export-all-btn');
     const zip = await env.readZip();
     const markdown = await zip.text(zip.find(/\.md$/));
     const [, frontMatter] = markdown.split('---\n');

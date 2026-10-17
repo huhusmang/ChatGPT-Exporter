@@ -10,7 +10,7 @@ const json = (data, status = 200, headers = {}) => new Response(JSON.stringify(d
 function startFullExport(env, { incremental = false } = {}) {
     env.window.ChatGPTExporter.showDialog();
     if (incremental) env.click('#incremental-export');
-    env.click('#select-personal-btn');
+    env.click('#export-all-btn');
 }
 
 test('401 时刷新一次 Token 后重试', async () => {
@@ -170,7 +170,7 @@ test('选择器加载失败时显示错误信息', async () => {
     const api = new FakeChatGPT().route(/^\/backend-api\/conversations\?/, () => json({}, 500));
     const env = loadExporter({ api });
     env.window.ChatGPTExporter.showDialog();
-    env.click('#select-personal-picker-btn');
+    env.click('#open-picker-btn');
     const status = await waitFor(() => {
         const text = env.$('#conv-status')?.textContent || '';
         return text.includes('加载失败') && text;
@@ -189,7 +189,7 @@ test('附件下载到对话文件夹，并在 Markdown 中引用', async () => {
     const env = loadExporter({ api });
     env.window.ChatGPTExporter.showDialog();
     env.click('#include-attachments');
-    env.click('#select-personal-btn');
+    env.click('#export-all-btn');
     const result = await env.readZip();
     const image = result.find(/_files\/photo\.png$/);
     assert.ok(image, '应包含附件');

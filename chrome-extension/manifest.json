@@ -7,7 +7,6 @@
     "storage",
     "alarms",
     "notifications",
-    "tabs",
     "scripting"
   ],
   "host_permissions": [
@@ -33,9 +32,7 @@
     {
       "matches": [
         "https://chatgpt.com/*",
-        "https://*.chatgpt.com/*",
-        "https://chat.openai.com/*",
-        "https://*.openai.com/*"
+        "https://chat.openai.com/*"
       ],
       "js": [
         "content/inject-exporter.js",
@@ -52,9 +49,7 @@
       ],
       "matches": [
         "https://chatgpt.com/*",
-        "https://*.chatgpt.com/*",
-        "https://chat.openai.com/*",
-        "https://*.openai.com/*"
+        "https://chat.openai.com/*"
       ]
     }
   ]

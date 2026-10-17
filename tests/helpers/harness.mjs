@@ -165,9 +165,13 @@ export function loadExporter({ api = new FakeChatGPT(), extension = false } = {}
     const alerts = [];
     const confirms = [];
     const downloads = [];
+    const downloadNames = [];
 
     window.document.cookie = 'oai-did=test-device';
     window.JSZip = JSZip;
+    // JSZip 在 Node 环境里加载，用 instanceof 判断二进制类型，所以脚本也要用同一套构造函数。
+    window.Uint8Array = Uint8Array;
+    window.ArrayBuffer = ArrayBuffer;
     window.Headers = Headers;
     window.Response = Response;
     window.alert = message => alerts.push(String(message));
@@ -181,6 +185,9 @@ export function loadExporter({ api = new FakeChatGPT(), extension = false } = {}
         return `blob:https://chatgpt.com/${downloads.length}`;
     };
     window.URL.revokeObjectURL = () => {};
+    window.HTMLAnchorElement.prototype.click = function () {
+        if (this.download) downloadNames.push(this.download);
+    };
     // 脚本里的节流等待只影响速度，测试中统一压缩为 0。
     const realSetTimeout = window.setTimeout.bind(window);
     window.setTimeout = (fn, _ms, ...args) => realSetTimeout(fn, 0, ...args);
@@ -195,6 +202,7 @@ export function loadExporter({ api = new FakeChatGPT(), extension = false } = {}
         alerts,
         confirms,
         downloads,
+        downloadNames,
         logs,
         $,
         $$: selector => [...window.document.querySelectorAll(selector)],

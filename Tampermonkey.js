@@ -28,63 +28,56 @@
     let capturedWorkspaceIds = new Set(); // 使用Set存储网络拦截到的ID，确保唯一性
 
     // --- 核心：网络拦截与信息捕获 ---
+    function readHeader(headers, name) {
+        if (!headers) return null;
+        if (typeof headers.get === 'function') return headers.get(name);
+        const lowerName = name.toLowerCase();
+        if (Array.isArray(headers)) {
+            const pair = headers.find(([key]) => String(key).toLowerCase() === lowerName);
+            return pair ? pair[1] : null;
+        }
+        const key = Object.keys(headers).find(k => k.toLowerCase() === lowerName);
+        return key ? headers[key] : null;
+    }
+
     (function interceptNetwork() {
         const rawFetch = window.fetch;
-        window.fetch = async function (resource, options) {
-            tryCaptureToken(options?.headers);
-            if (options?.headers?.['ChatGPT-Account-Id']) {
-                const id = options.headers['ChatGPT-Account-Id'];
+        window.fetch = function (resource, options) {
+            try {
+                const isRequest = typeof Request !== 'undefined' && resource instanceof Request;
+                const headers = options?.headers || (isRequest ? resource.headers : null);
+                tryCaptureToken(readHeader(headers, 'Authorization'));
+                const id = readHeader(headers, 'ChatGPT-Account-Id');
                 if (id && !capturedWorkspaceIds.has(id)) {
                     console.log('🎯 [Fetch] 捕获到 Workspace ID:', id);
                     capturedWorkspaceIds.add(id);
                 }
-            }
+            } catch (_) {}
             return rawFetch.apply(this, arguments);
-        };
-
-        const rawOpen = XMLHttpRequest.prototype.open;
-        XMLHttpRequest.prototype.open = function () {
-            this.addEventListener('readystatechange', () => {
-                if (this.readyState === 4) {
-                    try {
-                        tryCaptureToken(this.getRequestHeader('Authorization'));
-                        const id = this.getRequestHeader('ChatGPT-Account-Id');
-                        if (id && !capturedWorkspaceIds.has(id)) {
-                            console.log('🎯 [XHR] 捕获到 Workspace ID:', id);
-                            capturedWorkspaceIds.add(id);
-                        }
-                    } catch (_) {}
-                }
-            });
-            return rawOpen.apply(this, arguments);
         };
     })();
 
-    function tryCaptureToken(header) {
-        if (!header) return;
-        const h = typeof header === 'string' ? header : header instanceof Headers ? header.get('Authorization') : header.Authorization || header.authorization;
-        if (h?.startsWith('Bearer ')) {
-        const token = h.slice(7);
-        // [v8.2.0 修复] 在捕获源头增加验证，拒绝已知的无效占位符Token
+    function tryCaptureToken(value) {
+        if (typeof value !== 'string' || !value.startsWith('Bearer ')) return;
+        const token = value.slice(7);
+        // 未登录时页面会发送占位符 "dummy"，不能当作真实 Token
         if (token && token.toLowerCase() !== 'dummy') {
             accessToken = token;
         }
-        }
-    }
+    }
 
-    async function ensureAccessToken() {
-        if (accessToken) return accessToken;
+    async function ensureAccessToken({ forceRefresh = false, silent = false } = {}) {
+        if (accessToken && !forceRefresh) return accessToken;
         try {
             const session = await (await fetch('/api/auth/session?unstable_client=true')).json();
-            if (session.accessToken) {
+            if (session?.accessToken) {
                 accessToken = session.accessToken;
                 return accessToken;
             }
         } catch (_) {}
-        alert('无法获取 Access Token。请刷新页面或打开任意一个对话后再试。');
+        if (!silent) alert('无法获取 Access Token。请刷新页面或打开任意一个对话后再试。');
         return null;
     }
-
     // --- 辅助函数 ---
     const sleep = ms => new Promise(r => setTimeout(r, ms));
     const jitter = () => BASE_DELAY + Math.random() * JITTER;
@@ -289,18 +282,16 @@
         return Array.from(references.values());
     }
 
-    function attachmentHeaders(workspaceId) {
+    function attachmentHeaders(accountId) {
         const headers = {
             'Authorization': `Bearer ${accessToken}`,
             'oai-device-id': getOaiDeviceId()
         };
-        const resolvedWorkspaceId = resolveWorkspaceId(workspaceId);
-        if (resolvedWorkspaceId) headers['ChatGPT-Account-Id'] = resolvedWorkspaceId;
+        if (accountId) headers['ChatGPT-Account-Id'] = accountId;
         return headers;
     }
 
-    async function fetchAttachmentBinary(reference, convData, workspaceId) {
-        const headers = attachmentHeaders(workspaceId);
+    async function fetchAttachmentBinary(reference, convData, accountId, session) {
         let metadataUrl;
         if (reference.kind === 'sandbox') {
             const conversationId = convData?.conversation_id || convData?.id;
@@ -314,8 +305,9 @@
             metadataUrl = `/backend-api/files/download/${encodeURIComponent(reference.fileId)}?inline=false`;
         }
 
-        const metadataResponse = await fetch(metadataUrl, { credentials: 'include', headers });
-        if (!metadataResponse.ok) throw new Error(`metadata HTTP ${metadataResponse.status}`);
+        const metadataResponse = await apiFetch(metadataUrl, {
+            accountId, session, label: 'metadata HTTP', init: { credentials: 'include' }
+        });
         const contentType = metadataResponse.headers.get('content-type') || '';
         if (!contentType.includes('json')) {
             const directName = addMimeExtension(reference.name, contentType);
@@ -328,7 +320,7 @@
         const parsedUrl = new URL(downloadUrl, location.origin);
         const sameOrigin = parsedUrl.origin === location.origin;
         const response = await fetch(parsedUrl.href, sameOrigin
-            ? { credentials: 'include', headers }
+            ? { credentials: 'include', headers: attachmentHeaders(accountId) }
             : {});
         if (!response.ok) throw new Error(`binary HTTP ${response.status}`);
         const mimeType = response.headers.get('content-type') || reference.mimeType || '';
@@ -343,7 +335,10 @@
         return path.split('/').map(segment => encodeURIComponent(segment)).join('/');
     }
 
-    async function appendAttachmentsToZip(target, convData, workspaceId) {
+    // 图片、音视频、压缩包和 Office 文档本身已经压缩过，再 DEFLATE 只会白白耗费打包时间。
+    const PRECOMPRESSED_FILE = /\.(?:png|jpe?g|gif|webp|avif|heic|mp3|m4a|aac|ogg|mp4|mov|webm|zip|gz|7z|rar|pdf|docx|xlsx|pptx)$/i;
+
+    async function appendAttachmentsToZip(target, convData, accountId, session = null) {
         const references = collectVisibleAttachments(convData);
         const failures = [];
         const files = [];
@@ -352,10 +347,13 @@
         const folderName = generateUniqueFilename(convData).replace(/\.json$/i, '') + '_files';
 
         for (const reference of references) {
+            if (session?.cancelled) break;
             try {
-                const downloaded = await fetchAttachmentBinary(reference, convData, workspaceId);
+                const downloaded = await fetchAttachmentBinary(reference, convData, accountId, session);
                 const filename = uniqueAttachmentName(downloaded.filename, usedNames);
-                target.folder(folderName).file(filename, downloaded.data);
+                target.folder(folderName).file(filename, downloaded.data, {
+                    compression: PRECOMPRESSED_FILE.test(filename) ? 'STORE' : 'DEFLATE'
+                });
                 const relativePath = encodeRelativePath(`${folderName}/${filename}`);
                 files.push({
                     name: filename,
@@ -586,7 +584,8 @@
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
-        URL.revokeObjectURL(a.href);
+        // 立即回收会让部分浏览器（Firefox、Safari）的大文件下载失败
+        setTimeout(() => URL.revokeObjectURL(a.href), 60000);
     }
 
     // --- 悬浮导出按钮（紧凑悬浮球：可拖动、位置记忆、贴边半隐藏） ---
@@ -768,7 +767,6 @@
 }
 #gpt-rescue-btn:hover { box-shadow: 0 4px 16px rgba(0, 0, 0, .24); }
 #gpt-rescue-btn.gre-dragging { transition: none; cursor: grabbing; }
-#gpt-rescue-btn:disabled { cursor: default; }
 #gpt-rescue-btn:focus-visible { outline: 2px solid #10a37f; outline-offset: 2px; }
 
 html.dark #gpt-rescue-btn {
@@ -890,7 +888,7 @@ html.dark #gre-fab-status {
         btn.dataset.fabBound = '1';
 
         btn.addEventListener('pointerdown', (e) => {
-            if (e.button !== 0 || btn.disabled) return;
+            if (e.button !== 0) return;
             fabDragInfo = {
                 id: e.pointerId,
                 startX: e.clientX,
@@ -949,7 +947,10 @@ html.dark #gre-fab-status {
                 fabScheduleCollapse(btn);
                 return;
             }
-            if (btn.classList.contains('gre-busy') || btn.classList.contains('gre-progress')) return;
+            if (activeExport) {
+                requestCancelActiveExport();
+                return;
+            }
             showExportDialog();
         });
 
@@ -981,7 +982,7 @@ html.dark #gre-fab-status {
             fabApply(btn, fabSnap(fabClamp(saved ? { x: saved.x, y: saved.y } : fabDefaultPosition())));
             if (saved && saved.collapsed && fabState.docked) fabCollapse(btn);
         }
-        if (!btn.disabled) setFabStatus(btn, EXPORT_BUTTON_LABEL);
+        if (!activeExport) setFabStatus(btn, EXPORT_BUTTON_LABEL);
         btn.dataset.exporterVersion = EXPORTER_VERSION;
         return btn;
     }
@@ -998,14 +999,53 @@ html.dark #gre-fab-status {
 
     // --- 导出流程核心逻辑 ---
 
+    let activeExport = null;
+
+    function createCancelError() {
+        const error = new Error('已取消导出');
+        error.cancelled = true;
+        error.stopsBatch = true;
+        return error;
+    }
+
+    // 导出和列表加载共用：汇报进度、响应取消、在限流退避时倒计时。
+    function createTaskSession(onProgress) {
+        return {
+            cancelled: false,
+            progress(text) {
+                onProgress?.(text);
+            },
+            throwIfCancelled() {
+                if (this.cancelled) throw createCancelError();
+            },
+            async wait(ms, describe) {
+                const until = Date.now() + ms;
+                while (Date.now() < until) {
+                    this.throwIfCancelled();
+                    if (describe) this.progress(describe(Math.ceil((until - Date.now()) / 1000)));
+                    await sleep(Math.min(1000, until - Date.now()));
+                }
+                this.throwIfCancelled();
+            }
+        };
+    }
+
+    function requestCancelActiveExport() {
+        if (!activeExport || activeExport.cancelled) return;
+        if (!confirm('要停止当前导出吗？已经导出的对话会照常打包下载。')) return;
+        activeExport.cancelled = true;
+        activeExport.progress('⏹ 正在停止…');
+    }
+
     // JSON 是无损备份，必须最先写入；附件或 Markdown 出错只降级为部分成功，不影响已写入的 JSON。
-    async function addConversationToZip(target, convData, workspaceId, attachmentReport = null) {
+    async function addConversationToZip(target, convData, context) {
+        const { accountId, attachmentReport, session } = context;
         target.file(generateUniqueFilename(convData), JSON.stringify(convData, null, 2));
         const stageErrors = [];
         let attachmentResult = null;
         if (attachmentReport) {
             try {
-                attachmentResult = await appendAttachmentsToZip(target, convData, workspaceId);
+                attachmentResult = await appendAttachmentsToZip(target, convData, accountId, session);
                 attachmentReport.detected += attachmentResult.detected;
                 attachmentReport.downloaded += attachmentResult.files.length;
                 attachmentReport.failed += attachmentResult.failures.length;
@@ -1053,47 +1093,119 @@ html.dark #gre-fab-status {
         console.error(`[ChatGPT Exporter] ${stage} 阶段失败 (${entry?.id || entry?.folder || 'unknown'}):`, error);
     }
 
-    // 返回 'ok' | 'partial' | 'failed' | 'stopped'；只有 'stopped' 需要调用方终止批量导出。
-    async function exportConversationSafely(target, entry, workspaceId, attachmentReport, errorReport) {
+    // outcome 为 'ok' | 'partial' | 'failed' | 'stopped'；只有 'stopped' 需要调用方终止批量导出。
+    async function exportConversationSafely(target, entry, context) {
+        const { errorReport, session, accountId } = context;
         let convData;
         try {
-            convData = await getConversation(entry.id, workspaceId);
+            convData = await getConversation(entry.id, accountId, session);
         } catch (error) {
+            if (error?.cancelled) {
+                errorReport.stopped_reason = error.message;
+                return { outcome: 'stopped' };
+            }
             errorReport.failed += 1;
             recordExportIssue(errorReport, entry, 'fetch', error);
             if (error?.stopsBatch) {
                 errorReport.stopped_reason = error.message;
-                return 'stopped';
+                return { outcome: 'stopped' };
             }
-            return 'failed';
+            return { outcome: 'failed' };
         }
 
         const issueEntry = { ...entry, title: convData?.title || entry.title };
+        const updateTime = normalizeEpochSeconds(convData?.update_time);
         let stageErrors;
         try {
-            stageErrors = await addConversationToZip(target, convData, workspaceId, attachmentReport);
+            stageErrors = await addConversationToZip(target, convData, context);
         } catch (error) {
             errorReport.failed += 1;
             recordExportIssue(errorReport, issueEntry, 'json', error);
-            return 'failed';
+            return { outcome: 'failed' };
         }
         if (stageErrors.length === 0) {
             errorReport.succeeded += 1;
-            return 'ok';
+            return { outcome: 'ok', updateTime };
         }
         errorReport.partial += 1;
         stageErrors.forEach(({ stage, error }) => recordExportIssue(errorReport, issueEntry, stage, error));
-        return 'partial';
+        return { outcome: 'partial', updateTime };
     }
 
-    function buildExportSummary(errorReport) {
-        if (errorReport.issues.length === 0) return '✅ 导出完成！';
+    function buildExportSummary(errorReport, { skippedUnchanged = 0 } = {}) {
+        const skippedLine = skippedUnchanged > 0
+            ? `\n增量导出：跳过了 ${skippedUnchanged} 个自上次导出后没有变化的对话。`
+            : '';
+        if (errorReport.issues.length === 0 && !errorReport.stopped_reason) {
+            return `✅ 导出完成！共 ${errorReport.succeeded} 个对话。${skippedLine}`;
+        }
         const head = errorReport.stopped_reason
             ? `⚠️ 导出已提前停止，ZIP 中只包含停止前导出的对话。\n原因：${errorReport.stopped_reason}`
             : '⚠️ 导出完成，但有部分内容失败。';
         const listFailures = errorReport.issues.filter(issue => issue.stage === 'list').length;
-        const listLine = listFailures > 0 ? `\n另有 ${listFailures} 个项目的对话列表获取失败。` : '';
-        return `${head}\n成功 ${errorReport.succeeded}，部分成功（已存 JSON，缺 Markdown 或附件）${errorReport.partial}，失败 ${errorReport.failed}。${listLine}\n详情见 ZIP 内的 export-error-report.json。`;
+        const listLine = listFailures > 0 ? `\n另有 ${listFailures} 处对话列表获取失败，可能漏掉了部分项目对话。` : '';
+        return `${head}\n成功 ${errorReport.succeeded}，部分成功（已存 JSON，缺 Markdown 或附件）${errorReport.partial}，失败 ${errorReport.failed}。${listLine}${skippedLine}\n详情见 ZIP 内的 export-error-report.json。`;
+    }
+
+    // --- 增量导出记录：按账户记住每个对话上次导出时的更新时间 ---
+    const EXPORT_HISTORY_KEY = 'chatgpt-exporter-history-v1';
+
+    function exportHistoryStorageKey(accountId) {
+        return `${EXPORT_HISTORY_KEY}:${accountId || 'default'}`;
+    }
+
+    function loadExportHistory(accountId) {
+        try {
+            const saved = JSON.parse(localStorage.getItem(exportHistoryStorageKey(accountId)));
+            return saved && typeof saved === 'object' ? saved : {};
+        } catch (_) {
+            return {};
+        }
+    }
+
+    function saveExportHistory(accountId, history, exported) {
+        exported.forEach(({ id, updateTime }) => {
+            if (id && updateTime) history[id] = Math.max(updateTime, Number(history[id]) || 0);
+        });
+        try {
+            localStorage.setItem(exportHistoryStorageKey(accountId), JSON.stringify(history));
+        } catch (error) {
+            console.warn('[ChatGPT Exporter] 保存增量导出记录失败:', error);
+        }
+    }
+
+    function clearExportHistory() {
+        try {
+            Object.keys(localStorage)
+                .filter(key => key.startsWith(`${EXPORT_HISTORY_KEY}:`))
+                .forEach(key => localStorage.removeItem(key));
+        } catch (_) {}
+    }
+
+    function isUnchangedSinceLastExport(entry, history) {
+        const exportedAt = Number(history[entry.id]) || 0;
+        const updatedAt = Number(entry.update_time) || 0;
+        return exportedAt > 0 && updatedAt > 0 && exportedAt >= updatedAt;
+    }
+
+    function localDateStamp(date = new Date()) {
+        const pad = value => String(value).padStart(2, '0');
+        return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+    }
+
+    function buildZipFilename({ mode, workspaceId, selected, incremental }) {
+        const kind = selected ? 'selected' : incremental ? 'incremental' : 'backup';
+        const space = mode === 'team' ? 'team' : mode === 'project' ? 'project' : 'personal';
+        const workspacePart = mode === 'team' && workspaceId ? `_${workspaceId}` : '';
+        return `chatgpt_${space}_${kind}${workspacePart}_${localDateStamp()}.zip`;
+    }
+
+    function showExportResult(message) {
+        alert(message);
+    }
+
+    function showNotice(message) {
+        alert(message);
     }
 
     async function exportConversations(options = {}) {
@@ -1101,194 +1213,205 @@ html.dark #gre-fab-status {
             mode = 'personal',
             workspaceId = null,
             conversationEntries = null,
-            exportType = null,
-            includeAttachments = false
+            includeAttachments = false,
+            incremental = false
         } = options;
-        const btn = getExportButton();
-        btn.disabled = true;
-
-        if (!await ensureAccessToken()) {
-            btn.disabled = false;
-            setFabStatus(btn, EXPORT_BUTTON_LABEL);
+        if (activeExport) {
+            showNotice('已有导出任务正在进行。点击悬浮球可以停止当前导出。');
             return;
         }
+        const btn = getExportButton();
+        if (!await ensureAccessToken()) return;
+
+        const session = createTaskSession(text => setFabStatus(btn, text));
+        activeExport = session;
+        const accountId = resolveWorkspaceId(workspaceId);
+        const selected = Array.isArray(conversationEntries) && conversationEntries.length > 0;
+        const errorReport = createExportErrorReport();
+        const attachmentReport = includeAttachments ? {
+            exporter_version: EXPORTER_VERSION,
+            generated_at: new Date().toISOString(),
+            detected: 0,
+            downloaded: 0,
+            failed: 0,
+            conversations: []
+        } : null;
+        let finalStatus = '⚠️ Error';
 
         try {
+            let entries = conversationEntries;
+            if (!selected) {
+                session.progress('📂 读取对话列表…');
+                const listing = await collectConversationEntries({ mode, accountId, session });
+                listing.problems.forEach(({ folder, error }) => recordExportIssue(errorReport, { folder }, 'list', error));
+                entries = listing.entries;
+            }
+
+            const history = loadExportHistory(accountId);
+            let skippedUnchanged = 0;
+            if (incremental && !selected) {
+                const changed = entries.filter(entry => !isUnchangedSinceLastExport(entry, history));
+                skippedUnchanged = entries.length - changed.length;
+                entries = changed;
+            }
+            if (entries.length === 0) {
+                finalStatus = '✅ 完成';
+                const listProblems = errorReport.issues.length > 0
+                    ? `\n另有 ${errorReport.issues.length} 处对话列表获取失败，详情请查看控制台。`
+                    : '';
+                showExportResult(skippedUnchanged > 0
+                    ? `✅ 没有需要导出的对话：${skippedUnchanged} 个对话自上次导出后都没有变化。${listProblems}`
+                    : `没有找到可以导出的对话。${listProblems}`);
+                return;
+            }
+
             const zip = new JSZip();
-            const attachmentReport = includeAttachments ? {
-                exporter_version: EXPORTER_VERSION,
-                generated_at: new Date().toISOString(),
-                detected: 0,
-                downloaded: 0,
-                failed: 0,
-                conversations: []
-            } : null;
-            const errorReport = createExportErrorReport();
-            let stopped = false;
-            const exportOne = async (target, entry) => {
-                const outcome = await exportConversationSafely(target, entry, workspaceId, attachmentReport, errorReport);
-                if (outcome === 'stopped') {
-                    stopped = true;
-                    return;
+            const exported = [];
+            const context = { accountId, attachmentReport, errorReport, session };
+            for (let i = 0; i < entries.length; i++) {
+                if (session.cancelled) {
+                    errorReport.stopped_reason = '已取消导出';
+                    break;
                 }
-                await sleep(jitter());
-            };
+                const entry = entries[i];
+                const label = entry?.title ? entry.title.slice(0, 12) : '对话';
+                session.progress(`📥 ${label} (${i + 1}/${entries.length})`);
+                const target = entry?.projectTitle
+                    ? zip.folder(sanitizeFilename(entry.projectTitle))
+                    : zip;
+                const { outcome, updateTime } = await exportConversationSafely(target, {
+                    id: entry.id,
+                    title: entry?.title || null,
+                    folder: entry?.projectTitle || null
+                }, context);
+                if (outcome === 'ok' || outcome === 'partial') {
+                    exported.push({ id: entry.id, updateTime: Math.max(Number(entry.update_time) || 0, updateTime || 0) });
+                }
+                if (outcome === 'stopped') break;
+                if (i < entries.length - 1) await sleep(jitter());
+            }
 
-            if (Array.isArray(conversationEntries) && conversationEntries.length > 0) {
-                for (let i = 0; i < conversationEntries.length && !stopped; i++) {
-                    const entry = conversationEntries[i];
-                    const label = entry?.title ? entry.title.slice(0, 12) : '对话';
-                    setFabStatus(btn, `📥 ${label} (${i + 1}/${conversationEntries.length})`);
-                    const target = entry?.projectTitle
-                        ? zip.folder(sanitizeFilename(entry.projectTitle))
-                        : zip;
-                    await exportOne(target, { id: entry.id, title: entry?.title || null, folder: entry?.projectTitle || null });
-                }
-            } else {
-                setFabStatus(btn, '📂 获取项目外对话…');
-                const orphanIds = await collectIds(btn, workspaceId, null);
-                for (let i = 0; i < orphanIds.length && !stopped; i++) {
-                    setFabStatus(btn, `📥 根目录 (${i + 1}/${orphanIds.length})`);
-                    await exportOne(zip, { id: orphanIds[i], title: null, folder: null });
-                }
-
-                if (!stopped) {
-                    setFabStatus(btn, '🔍 获取项目列表…');
-                    const projects = await getProjects(workspaceId);
-                    for (const project of projects) {
-                        if (stopped) break;
-                        const projectFolder = zip.folder(sanitizeFilename(project.title));
-                        setFabStatus(btn, `📂 项目: ${project.title}`);
-                        let projectConvIds;
-                        try {
-                            projectConvIds = await collectIds(btn, workspaceId, project.id);
-                        } catch (error) {
-                            recordExportIssue(errorReport, { folder: project.title }, 'list', error);
-                            if (error?.stopsBatch) {
-                                errorReport.stopped_reason = error.message;
-                                stopped = true;
-                            }
-                            continue;
-                        }
-
-                        for (let i = 0; i < projectConvIds.length && !stopped; i++) {
-                            setFabStatus(btn, `📥 ${project.title.substring(0,10)}... (${i + 1}/${projectConvIds.length})`);
-                            await exportOne(projectFolder, { id: projectConvIds[i], title: null, folder: project.title });
-                        }
-                    }
-                }
+            if (exported.length === 0) {
+                showExportResult(`${buildExportSummary(errorReport, { skippedUnchanged })}`.replace(/\n详情见 ZIP 内的 export-error-report\.json。$/, '\n没有导出任何对话，因此没有生成 ZIP。详情请查看控制台。'));
+                return;
             }
 
             if (attachmentReport) {
                 zip.file('attachment-export-report.json', JSON.stringify(attachmentReport, null, 2));
             }
-            const hasIssues = errorReport.issues.length > 0;
+            const hasIssues = errorReport.issues.length > 0 || Boolean(errorReport.stopped_reason);
             if (hasIssues) {
                 zip.file('export-error-report.json', JSON.stringify(errorReport, null, 2));
             }
-            setFabStatus(btn, '📦 生成 ZIP 文件…');
-            const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
-            const date = new Date().toISOString().slice(0, 10);
-            const selectionType = exportType || ((Array.isArray(conversationEntries) && conversationEntries.length > 0) ? 'selected' : 'full');
-            let filename = '';
-            if (selectionType === 'selected') {
-                filename = mode === 'team'
-                    ? `chatgpt_team_selected_${workspaceId}_${date}.zip`
-                    : mode === 'project'
-                        ? `chatgpt_project_selected_${date}.zip`
-                        : `chatgpt_personal_selected_${date}.zip`;
-            } else {
-                filename = mode === 'team'
-                    ? `chatgpt_team_backup_${workspaceId}_${date}.zip`
-                    : mode === 'project'
-                        ? `chatgpt_project_backup_${date}.zip`
-                        : `chatgpt_personal_backup_${date}.zip`;
-            }
-            downloadFile(blob, filename);
+
+            let lastPercent = -1;
+            const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' }, meta => {
+                const percent = Math.floor(meta.percent);
+                if (percent === lastPercent) return;
+                lastPercent = percent;
+                session.progress(`📦 生成 ZIP 文件 (${percent}/100)`);
+            });
+            downloadFile(blob, buildZipFilename({ mode, workspaceId, selected, incremental: incremental && !selected }));
+            saveExportHistory(accountId, history, exported);
+
             const attachmentSummary = attachmentReport
                 ? `\n附件：检测 ${attachmentReport.detected}，成功 ${attachmentReport.downloaded}，失败 ${attachmentReport.failed}。`
                 : '';
-            alert(`${buildExportSummary(errorReport)}${attachmentSummary}`);
-            setFabStatus(btn, hasIssues ? '⚠️ 部分完成' : '✅ 完成');
-
-        } catch (e) {
-            console.error("导出过程中发生严重错误:", e);
-            alert(`导出失败: ${e.message}。详情请查看控制台（F12 -> Console）。`);
-            setFabStatus(btn, '⚠️ Error');
+            finalStatus = hasIssues ? '⚠️ 部分完成' : '✅ 完成';
+            showExportResult(`${buildExportSummary(errorReport, { skippedUnchanged })}${attachmentSummary}`);
+        } catch (error) {
+            if (error?.cancelled) {
+                finalStatus = '⚠️ 已取消';
+                showExportResult('已取消导出。');
+            } else {
+                console.error('导出过程中发生严重错误:', error);
+                showExportResult(`导出失败: ${error.message}。详情请查看控制台（F12 -> Console）。`);
+            }
         } finally {
+            activeExport = null;
+            setFabStatus(btn, finalStatus);
             setTimeout(() => {
-                btn.disabled = false;
-                setFabStatus(btn, EXPORT_BUTTON_LABEL);
+                if (!activeExport) setFabStatus(btn, EXPORT_BUTTON_LABEL);
             }, 3000);
         }
     }
 
-    async function startExportProcess(mode, workspaceId, includeAttachments = false) {
-        await exportConversations({ mode, workspaceId, includeAttachments });
+    function startExportProcess(mode, workspaceId, options = {}) {
+        return exportConversations({ mode, workspaceId, ...options });
     }
 
-    async function startProjectSpaceExportProcess(workspaceId = null, includeAttachments = false) {
-        try {
-            const projectEntries = await listProjectSpaceConversations(workspaceId);
-            if (projectEntries.length === 0) {
-                alert('未找到项目空间对话。');
-                return;
-            }
-            await exportConversations({
-                mode: 'project',
-                workspaceId,
-                conversationEntries: projectEntries,
-                exportType: 'full',
-                includeAttachments
-            });
-        } catch (err) {
-            console.error('导出项目空间失败:', err);
-            alert(`导出项目空间失败: ${err.message}`);
-        }
-    }
-
-    async function startSelectiveExportProcess(mode, workspaceId, conversationEntries, includeAttachments = false) {
-        await exportConversations({ mode, workspaceId, conversationEntries, includeAttachments });
-    }
-
-    function startScheduledExport(options = {}) {
-        const {
-            mode = 'personal',
-            workspaceId = null,
-            autoConfirm = false,
-            source = 'schedule',
-            includeAttachments = false
-        } = options;
-        const proceed = async () => {
-            try {
-                if (mode === 'project') {
-                    await startProjectSpaceExportProcess(workspaceId, includeAttachments);
-                } else {
-                    await startExportProcess(mode, workspaceId, includeAttachments);
-                }
-            } catch (err) {
-                console.error('[ChatGPT Exporter] 自动导出失败:', err);
-            }
-        };
-
-        if (autoConfirm) {
-            proceed();
-            return;
-        }
-
-        const modeLabel = mode === 'team' ? '团队空间' : mode === 'project' ? '项目空间' : '个人空间';
-        if (confirm(`Chrome 扩展请求导出 ${modeLabel} 对话（来源: ${source}）。是否开始？`)) {
-            proceed();
-        }
+    function startSelectiveExportProcess(mode, workspaceId, conversationEntries, includeAttachments = false) {
+        return exportConversations({ mode, workspaceId, conversationEntries, includeAttachments });
     }
 
     // --- API 调用函数 ---
-    // 401（登录失效）和 429（限流）会让后续每个请求同样失败，批量导出应停止，而不是逐个跳过。
+    const RATE_LIMIT_RETRY_DELAYS = [15000, 30000, 60000];
+    const MAX_RETRY_AFTER_MS = 120000;
+
+    // 401（登录失效）和 429（限流）在重试后仍失败时，会让后续每个请求同样失败，批量导出应停止。
     function createHttpError(message, status) {
         const error = new Error(message);
         error.status = status;
         error.stopsBatch = status === 401 || status === 429;
         return error;
+    }
+
+    function describeHttpFailure(label, status) {
+        if (status === 429) {
+            return `${label}：官方接口限流 (429)，重试后仍未恢复。请等待几分钟后再试，或减少单次导出的对话数量。`;
+        }
+        if (status === 401) {
+            return `${label}：登录状态已失效 (401)，请刷新页面后重试。`;
+        }
+        return `${label} (${status})`;
+    }
+
+    function retryAfterMs(response) {
+        const header = response.headers?.get?.('retry-after');
+        if (header == null || header === '') return null;
+        const seconds = Number(header);
+        const ms = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(header) - Date.now();
+        return Number.isFinite(ms) ? Math.min(Math.max(ms, 0), MAX_RETRY_AFTER_MS) : null;
+    }
+
+    // 所有 backend-api 请求的统一入口：补齐认证和账户请求头；401 时刷新一次 Token；
+    // 429 时按 Retry-After（没有则按固定间隔）退避重试。
+    async function apiFetch(path, { accountId = null, session = null, label = '请求失败', init = {} } = {}) {
+        const deviceId = getOaiDeviceId();
+        if (!deviceId) {
+            const error = new Error('无法获取 oai-device-id，请确保已登录并刷新页面。');
+            error.stopsBatch = true;
+            throw error;
+        }
+        let tokenRefreshed = false;
+        let rateLimitRetries = 0;
+        for (;;) {
+            session?.throwIfCancelled();
+            const headers = {
+                ...(init.headers || {}),
+                'Authorization': `Bearer ${accessToken}`,
+                'oai-device-id': deviceId
+            };
+            if (accountId) headers['ChatGPT-Account-Id'] = accountId;
+            const response = await fetch(path, { ...init, headers });
+            if (response.ok) return response;
+
+            if (response.status === 401 && !tokenRefreshed) {
+                tokenRefreshed = true;
+                if (await ensureAccessToken({ forceRefresh: true, silent: true })) continue;
+            }
+            if (response.status === 429 && rateLimitRetries < RATE_LIMIT_RETRY_DELAYS.length) {
+                const delay = retryAfterMs(response) ?? RATE_LIMIT_RETRY_DELAYS[rateLimitRetries];
+                rateLimitRetries++;
+                if (session) {
+                    await session.wait(delay, seconds => `⏳ 接口限流，${seconds} 秒后重试…`);
+                } else {
+                    await sleep(delay);
+                }
+                continue;
+            }
+            throw createHttpError(describeHttpFailure(label, response.status), response.status);
+        }
     }
 
     function normalizeProjectSpaceItem(item) {
@@ -1310,109 +1433,6 @@ html.dark #gre-fab-status {
         if (match?.[1]) return match[1];
         const detectedIds = detectAllWorkspaceIds();
         return detectedIds.length > 0 ? detectedIds[0] : null;
-    }
-
-    async function getProjectSpaces(workspaceId, options = {}) {
-        const deviceId = getOaiDeviceId();
-        if (!deviceId) {
-            throw new Error('无法获取 oai-device-id，请确保已登录并刷新页面。');
-        }
-        const headers = {
-            'Authorization': `Bearer ${accessToken}`,
-            'oai-device-id': deviceId
-        };
-        const resolvedWorkspaceId = resolveWorkspaceId(workspaceId);
-        if (resolvedWorkspaceId) { headers['ChatGPT-Account-Id'] = resolvedWorkspaceId; }
-
-        const projects = new Map();
-        let cursor = null;
-
-        do {
-            const query = new URLSearchParams();
-            query.set('limit', String(PROJECT_SIDEBAR_LIMIT));
-            if (options.conversationsPerGizmo !== undefined) {
-                query.set('conversations_per_gizmo', String(options.conversationsPerGizmo));
-            }
-            if (options.ownedOnly !== undefined) {
-                query.set('owned_only', options.ownedOnly ? 'true' : 'false');
-            }
-            if (cursor) {
-                query.set('cursor', cursor);
-            }
-
-            const r = await fetch(`/backend-api/gizmos/snorlax/sidebar?${query.toString()}`, { headers });
-            if (!r.ok) {
-                throw new Error(`获取项目空间列表失败 (${r.status})`);
-            }
-            const data = await r.json();
-            data.items?.forEach(item => {
-                const project = normalizeProjectSpaceItem(item);
-                if (project) {
-                    projects.set(project.id, project);
-                }
-            });
-            cursor = data.cursor || null;
-            if (cursor) {
-                await sleep(jitter());
-            }
-        } while (cursor);
-
-        return Array.from(projects.values());
-    }
-
-    async function getProjects(workspaceId) {
-        if (!workspaceId) return [];
-        try {
-            const projects = await getProjectSpaces(workspaceId);
-            return projects.map(({ id, title }) => ({ id, title }));
-        } catch (err) {
-            console.warn(`获取项目(Gizmo)列表失败 (${err?.message || err})`);
-            return [];
-        }
-    }
-
-    async function collectIds(btn, workspaceId, gizmoId) {
-        const all = new Set();
-        const deviceId = getOaiDeviceId();
-        if (!deviceId) {
-            throw new Error('无法获取 oai-device-id，请确保已登录并刷新页面。');
-        }
-        const headers = {
-            'Authorization': `Bearer ${accessToken}`,
-            'oai-device-id': deviceId
-        };
-        if (workspaceId) { headers['ChatGPT-Account-Id'] = workspaceId; }
-
-        if (gizmoId) {
-            let cursor = '0';
-            do {
-                const r = await fetch(`/backend-api/gizmos/${gizmoId}/conversations?cursor=${cursor}`, { headers });
-                if (!r.ok) throw createHttpError(`列举项目对话列表失败 (${r.status})`, r.status);
-                const j = await r.json();
-                j.items?.forEach(it => all.add(it.id));
-                cursor = j.cursor;
-                await sleep(jitter());
-            } while (cursor);
-        } else {
-            for (const is_archived of [false, true]) {
-                let offset = 0, has_more = true, page = 0;
-                do {
-                    setFabStatus(btn, `📂 项目外对话 (${is_archived ? 'Archived' : 'Active'} p${++page})`);
-                    const r = await fetch(`/backend-api/conversations?offset=${offset}&limit=${PAGE_LIMIT}&order=updated${is_archived ? '&is_archived=true' : ''}`, { headers });
-                    if (!r.ok) throw createHttpError(`列举项目外对话列表失败 (${r.status})`, r.status);
-                    const j = await r.json();
-                    if (j.items && j.items.length > 0) {
-                        j.items.forEach(it => all.add(it.id));
-                        has_more = j.items.length === PAGE_LIMIT;
-                        offset += j.items.length;
-                    } else {
-                        has_more = false;
-                    }
-                    await sleep(jitter());
-                } while (has_more);
-            }
-        }
-        return Array.from(all);
     }
 
     function upsertConversationEntry(map, item, extra = {}) {
@@ -1449,139 +1469,125 @@ html.dark #gre-fab-status {
         }
     }
 
-    async function listConversations(workspaceId) {
-        if (!await ensureAccessToken()) {
-            throw new Error('无法获取 Access Token，请刷新页面或打开任意一个对话后再试。');
-        }
-
-        const deviceId = getOaiDeviceId();
-        if (!deviceId) {
-            throw new Error('无法获取 oai-device-id，请确保已登录并刷新页面。');
-        }
-
-        const headers = {
-            'Authorization': `Bearer ${accessToken}`,
-            'oai-device-id': deviceId
-        };
-        if (workspaceId) { headers['ChatGPT-Account-Id'] = workspaceId; }
-
-        const map = new Map();
-        const addEntry = (item, extra = {}) => upsertConversationEntry(map, item, extra);
-
-        for (const is_archived of [false, true]) {
-            let offset = 0;
-            let has_more = true;
-            do {
-                const r = await fetch(`/backend-api/conversations?offset=${offset}&limit=${PAGE_LIMIT}&order=updated${is_archived ? '&is_archived=true' : ''}`, { headers });
-                if (!r.ok) throw new Error(`列举对话列表失败 (${r.status})`);
-                const j = await r.json();
-                if (j.items && j.items.length > 0) {
-                    j.items.forEach(it => addEntry(it, { is_archived }));
-                    has_more = j.items.length === PAGE_LIMIT;
-                    offset += j.items.length;
-                } else {
-                    has_more = false;
-                }
-                await sleep(jitter());
-            } while (has_more);
-        }
-
-        if (workspaceId) {
-            const projects = await getProjects(workspaceId);
-            for (const project of projects) {
-                let cursor = '0';
-                do {
-                    const r = await fetch(`/backend-api/gizmos/${project.id}/conversations?cursor=${cursor}`, { headers });
-                    if (!r.ok) throw new Error(`列举项目对话列表失败 (${r.status})`);
-                    const j = await r.json();
-                    j.items?.forEach(it => addEntry(it, { projectId: project.id, projectTitle: project.title }));
-                    cursor = j.cursor;
-                    await sleep(jitter());
-                } while (cursor);
+    async function listProjects(accountId, session, query = {}) {
+        const projects = new Map();
+        let cursor = null;
+        do {
+            const params = new URLSearchParams({ limit: String(PROJECT_SIDEBAR_LIMIT) });
+            if (query.conversationsPerGizmo !== undefined) {
+                params.set('conversations_per_gizmo', String(query.conversationsPerGizmo));
             }
-        }
-
-        return Array.from(map.values())
-            .sort((a, b) => (b.update_time || 0) - (a.update_time || 0));
+            if (query.ownedOnly !== undefined) {
+                params.set('owned_only', query.ownedOnly ? 'true' : 'false');
+            }
+            if (cursor) params.set('cursor', cursor);
+            const response = await apiFetch(`/backend-api/gizmos/snorlax/sidebar?${params}`, {
+                accountId, session, label: '获取项目列表失败'
+            });
+            const data = await response.json();
+            (data.items || []).forEach(item => {
+                const project = normalizeProjectSpaceItem(item);
+                if (project) projects.set(project.id, project);
+            });
+            cursor = data.cursor || null;
+            if (cursor) await sleep(jitter());
+        } while (cursor);
+        return Array.from(projects.values());
     }
 
-    async function listProjectSpaceConversations(workspaceId) {
-        if (!await ensureAccessToken()) {
-            throw new Error('无法获取 Access Token，请刷新页面或打开任意一个对话后再试。');
+    async function listRootConversations(map, accountId, session) {
+        for (const isArchived of [false, true]) {
+            let offset = 0;
+            for (;;) {
+                const query = `offset=${offset}&limit=${PAGE_LIMIT}&order=updated${isArchived ? '&is_archived=true' : ''}`;
+                const response = await apiFetch(`/backend-api/conversations?${query}`, {
+                    accountId, session, label: '获取对话列表失败'
+                });
+                const data = await response.json();
+                const items = Array.isArray(data.items) ? data.items : [];
+                const sizeBefore = map.size;
+                items.forEach(item => upsertConversationEntry(map, item, { is_archived: isArchived }));
+                offset += items.length;
+                session?.progress(`📂 读取对话列表… 已找到 ${map.size} 个`);
+                // 服务端可能把单页数量压到 PAGE_LIMIT 以下：有 total 时以 total 为准，否则翻到空页为止；
+                // 一页里没有任何新对话时也停止，防止接口忽略 offset 导致死循环。
+                const reachedEnd = items.length === 0
+                    || map.size === sizeBefore
+                    || (Number.isFinite(data.total) && offset >= data.total);
+                if (reachedEnd) break;
+                await sleep(jitter());
+            }
         }
+    }
 
-        const deviceId = getOaiDeviceId();
-        if (!deviceId) {
-            throw new Error('无法获取 oai-device-id，请确保已登录并刷新页面。');
-        }
+    // 返回 null 表示完整获取；返回 Error 表示只拿到了侧边栏里的预览对话。
+    async function listProjectConversations(map, project, accountId, session) {
+        const extra = { projectId: project.id, projectTitle: project.title };
+        let cursor = '0';
+        let fetchedAny = false;
+        do {
+            let response;
+            try {
+                response = await apiFetch(`/backend-api/gizmos/${project.id}/conversations?cursor=${cursor}`, {
+                    accountId, session, label: `获取项目「${project.title}」的对话列表失败`
+                });
+            } catch (error) {
+                if (fetchedAny || error?.stopsBatch || !project.conversations?.length) throw error;
+                project.conversations.forEach(item => upsertConversationEntry(map, item, extra));
+                return new Error(`${error.message}，已改用侧边栏中的 ${project.conversations.length} 个预览对话`);
+            }
+            const data = await response.json();
+            (data.items || []).forEach(item => upsertConversationEntry(map, item, extra));
+            fetchedAny = true;
+            cursor = data.cursor || null;
+            if (cursor) await sleep(jitter());
+        } while (cursor);
+        return null;
+    }
 
-        const headers = {
-            'Authorization': `Bearer ${accessToken}`,
-            'oai-device-id': deviceId
-        };
-        const resolvedWorkspaceId = resolveWorkspaceId(workspaceId);
-        if (resolvedWorkspaceId) { headers['ChatGPT-Account-Id'] = resolvedWorkspaceId; }
-
+    // mode 为 'project' 时只列项目内对话，其余模式列出项目外和项目内的全部对话。
+    // 单个项目失败只记入 problems，不影响其他项目；登录失效、限流或取消会直接抛出。
+    async function collectConversationEntries({ mode, accountId, session = null }) {
         const map = new Map();
-        const projects = await getProjectSpaces(resolvedWorkspaceId, { conversationsPerGizmo: PROJECT_SIDEBAR_PREVIEW, ownedOnly: true });
+        const problems = [];
+        if (mode !== 'project') {
+            await listRootConversations(map, accountId, session);
+        }
+
+        let projects = [];
+        try {
+            session?.progress('🔍 读取项目列表…');
+            const query = mode === 'team' ? {} : { conversationsPerGizmo: PROJECT_SIDEBAR_PREVIEW, ownedOnly: true };
+            projects = await listProjects(accountId, session, query);
+        } catch (error) {
+            if (mode === 'project' || error?.stopsBatch) throw error;
+            problems.push({ folder: null, error });
+        }
 
         for (const project of projects) {
-            let cursor = '0';
-            let fetched = false;
-            do {
-                const r = await fetch(`/backend-api/gizmos/${project.id}/conversations?cursor=${cursor}`, { headers });
-                if (!r.ok) {
-                    if (!fetched && Array.isArray(project.conversations) && project.conversations.length > 0) {
-                        console.warn(`项目空间对话列表请求失败 (${r.status})，使用侧边栏返回的预览对话。`);
-                        project.conversations.forEach(item => upsertConversationEntry(map, item, {
-                            projectId: project.id,
-                            projectTitle: project.title
-                        }));
-                        cursor = null;
-                        break;
-                    }
-                    throw new Error(`列举项目空间对话列表失败 (${r.status})`);
-                }
-                const j = await r.json();
-                j.items?.forEach(item => upsertConversationEntry(map, item, {
-                    projectId: project.id,
-                    projectTitle: project.title
-                }));
-                cursor = j.cursor;
-                fetched = true;
-                await sleep(jitter());
-            } while (cursor);
-        }
-
-        return Array.from(map.values())
-            .sort((a, b) => (b.update_time || 0) - (a.update_time || 0));
-    }
-
-    async function getConversation(id, workspaceId) {
-        const deviceId = getOaiDeviceId();
-        if (!deviceId) {
-            const error = new Error('无法获取 oai-device-id，请确保已登录并刷新页面。');
-            error.stopsBatch = true;
-            throw error;
-        }
-        const headers = {
-            'Authorization': `Bearer ${accessToken}`,
-            'oai-device-id': deviceId
-        };
-        const resolvedWorkspaceId = resolveWorkspaceId(workspaceId);
-        if (resolvedWorkspaceId) { headers['ChatGPT-Account-Id'] = resolvedWorkspaceId; }
-        const r = await fetch(`/backend-api/conversation/${id}`, { headers });
-        if (!r.ok) {
-            if (r.status === 429) {
-                throw createHttpError(`获取对话详情失败 conv ${id}：官方接口限流 (429)。请降低导出频率、减少单次导出的对话数量，等待几分钟后再试。`, 429);
+            session?.progress(`📂 读取项目「${project.title}」… 已找到 ${map.size} 个`);
+            try {
+                const warning = await listProjectConversations(map, project, accountId, session);
+                if (warning) problems.push({ folder: project.title, error: warning });
+            } catch (error) {
+                if (error?.stopsBatch) throw error;
+                problems.push({ folder: project.title, error });
             }
-            throw createHttpError(`获取对话详情失败 conv ${id} (${r.status})`, r.status);
         }
-        const j = await r.json();
-        j.__fetched_at = new Date().toISOString();
-        return j;
+
+        const entries = Array.from(map.values())
+            .sort((a, b) => (b.update_time || 0) - (a.update_time || 0));
+        return { entries, problems };
     }
 
+    async function getConversation(id, accountId, session = null) {
+        const response = await apiFetch(`/backend-api/conversation/${id}`, {
+            accountId, session, label: `获取对话详情失败 conv ${id}`
+        });
+        const data = await response.json();
+        data.__fetched_at = new Date().toISOString();
+        return data;
+    }
     // --- UI 相关函数 ---
     // (UI部分无变动，此处省略以保持简洁)
     /**
@@ -1646,8 +1652,18 @@ html.dark #gre-fab-status {
             fontFamily: 'sans-serif', color: '#333', boxSizing: 'border-box'
         });
 
-        const closeDialog = () => document.body.removeChild(overlay);
+        // 关闭选择器时停止仍在进行的列表加载，避免关闭后继续请求接口。
+        const listSession = createTaskSession(text => {
+            const statusEl = dialog.querySelector('#conv-status');
+            if (state.loading && statusEl) statusEl.textContent = text;
+        });
+        const closeDialog = () => {
+            listSession.cancelled = true;
+            overlay.remove();
+        };
         const state = {
+            loadError: null,
+            listWarning: null,
             list: [],
             filtered: [],
             selected: new Set(),
@@ -1787,7 +1803,7 @@ html.dark #gre-fab-status {
             };
             backBtn.onclick = () => {
                 closeDialog();
-                showExportDialog({ includeAttachments: state.includeAttachments });
+                showExportDialog({ includeAttachments: state.includeAttachments, incremental: options.incremental });
             };
             exportBtn.onclick = async () => {
                 if (state.selected.size === 0) return;
@@ -1835,13 +1851,18 @@ html.dark #gre-fab-status {
             if (exportBtn) exportBtn.disabled = controlsDisabled || state.selected.size === 0;
 
             listEl.innerHTML = '';
-            if (state.loading) {
-                statusEl.textContent = '正在加载列表...';
+            statusEl.style.color = '#666';
+            if (state.loading) return;
+            if (state.loadError) {
+                statusEl.textContent = `加载失败：${state.loadError}`;
+                statusEl.style.color = '#b91c1c';
                 return;
             }
 
             const visibleCount = Math.min(state.visibleCount, state.filtered.length);
-            statusEl.textContent = `共 ${state.list.length} 条，当前筛选 ${state.filtered.length} 条，显示 ${visibleCount} 条，已选 ${state.selected.size} 条`;
+            statusEl.textContent = `共 ${state.list.length} 条，当前筛选 ${state.filtered.length} 条，显示 ${visibleCount} 条，已选 ${state.selected.size} 条`
+                + (state.listWarning ? `。⚠️ ${state.listWarning}` : '');
+            if (state.listWarning) statusEl.style.color = '#92400e';
             exportBtn.textContent = `导出选中 (${state.selected.size})`;
 
             if (state.filtered.length === 0) {
@@ -1945,22 +1966,30 @@ html.dark #gre-fab-status {
         document.body.appendChild(overlay);
         overlay.onclick = (e) => { if (e.target === overlay) closeDialog(); };
 
-        const listPromise = mode === 'project'
-            ? listProjectSpaceConversations(workspaceId)
-            : listConversations(workspaceId);
-        listPromise
-            .then(list => {
-                state.list = list;
-                state.loading = false;
-                applyFilters();
-                renderList();
+        (async () => {
+            if (!await ensureAccessToken({ silent: true })) {
+                throw new Error('无法获取 Access Token。请刷新页面或打开任意一个对话后再试。');
+            }
+            return collectConversationEntries({ mode, accountId: resolveWorkspaceId(workspaceId), session: listSession });
+        })()
+            .then(({ entries, problems }) => {
+                state.list = entries;
+                if (problems.length > 0) {
+                    const names = problems.map(({ folder }) => folder ? `「${folder}」` : '项目列表').join('、');
+                    state.listWarning = `${names}读取失败或不完整，列表可能缺少部分项目对话（详情见控制台）`;
+                    problems.forEach(({ folder, error }) => console.warn(`[ChatGPT Exporter] 读取 ${folder || '项目列表'} 失败:`, error));
+                }
             })
             .catch(err => {
-                const statusEl = dialog.querySelector('#conv-status');
-                state.loading = false;
+                if (err?.cancelled) return;
+                console.error('[ChatGPT Exporter] 加载对话列表失败:', err);
+                state.loadError = err?.message || String(err);
                 state.list = [];
-                state.filtered = [];
-                statusEl.textContent = `加载失败: ${err.message}`;
+            })
+            .finally(() => {
+                if (listSession.cancelled) return;
+                state.loading = false;
+                applyFilters();
                 renderList();
             });
     }
@@ -1991,6 +2020,8 @@ html.dark #gre-fab-status {
 
         let pendingTeamAction = null;
         let includeAttachments = Boolean(options.includeAttachments);
+        let incremental = Boolean(options.incremental);
+        const exportOptions = () => ({ includeAttachments, incremental });
         const renderStep = (step, action = null) => {
             pendingTeamAction = action;
             let html = '';
@@ -2079,6 +2110,14 @@ html.dark #gre-fab-status {
                                         <span style="display: block; margin-top: 2px; color: #666; font-size: 12px;">默认关闭；开启后导出时间和 ZIP 体积可能明显增加。</span>
                                     </span>
                                 </label>
+                                <label style="display: flex; align-items: flex-start; gap: 8px; margin-top: 8px; padding: 12px; border: 1px solid #d1d5db; border-radius: 8px; background: #f9fafb; cursor: pointer;">
+                                    <input id="incremental-export" type="checkbox" ${incremental ? 'checked' : ''} style="margin-top: 2px;">
+                                    <span>
+                                        <strong style="display: block; font-size: 13px;">增量导出：只导出有变化的对话</strong>
+                                        <span style="display: block; margin-top: 2px; color: #666; font-size: 12px;">仅对“导出全部”生效，跳过上次导出后没有更新的对话。导出记录保存在当前浏览器。</span>
+                                        <button id="clear-history-btn" type="button" style="margin-top: 6px; padding: 0; border: none; background: none; color: #2563eb; cursor: pointer; font-size: 12px;">清除导出记录</button>
+                                    </span>
+                                </label>
                                 <div style="display: flex; justify-content: flex-end; margin-top: 24px;">
                                     <button id="cancel-btn" style="padding: 10px 16px; border: 1px solid #ccc; border-radius: 8px; background: #fff; cursor: pointer;">取消</button>
                                 </div>`;
@@ -2094,21 +2133,30 @@ html.dark #gre-fab-status {
                 includeAttachmentsInput.onchange = (event) => {
                     includeAttachments = event.target.checked;
                 };
+                document.getElementById('incremental-export').onchange = (event) => {
+                    incremental = event.target.checked;
+                };
+                document.getElementById('clear-history-btn').onclick = (event) => {
+                    event.preventDefault();
+                    if (!confirm('清除后，下一次增量导出会重新导出全部对话。确定清除吗？')) return;
+                    clearExportHistory();
+                    event.target.textContent = '已清除导出记录';
+                };
                 document.getElementById('select-personal-btn').onclick = () => {
                     closeDialog();
-                    startExportProcess('personal', null, includeAttachments);
+                    startExportProcess('personal', null, exportOptions());
                 };
                 document.getElementById('select-personal-picker-btn').onclick = () => {
                     closeDialog();
-                    showConversationPicker({ mode: 'personal', workspaceId: null, includeAttachments });
+                    showConversationPicker({ mode: 'personal', workspaceId: null, includeAttachments, incremental });
                 };
                 document.getElementById('select-project-btn').onclick = () => {
                     closeDialog();
-                    startProjectSpaceExportProcess(null, includeAttachments);
+                    startExportProcess('project', null, exportOptions());
                 };
                 document.getElementById('select-project-picker-btn').onclick = () => {
                     closeDialog();
-                    showConversationPicker({ mode: 'project', workspaceId: null, includeAttachments });
+                    showConversationPicker({ mode: 'project', workspaceId: null, includeAttachments, incremental });
                 };
                 const startTeamFlow = (action) => {
                     const detectedIds = detectAllWorkspaceIds();
@@ -2116,9 +2164,9 @@ html.dark #gre-fab-status {
                         const workspaceId = detectedIds[0];
                         closeDialog();
                         if (action === 'all') {
-                            startExportProcess('team', workspaceId, includeAttachments);
+                            startExportProcess('team', workspaceId, exportOptions());
                         } else {
-                            showConversationPicker({ mode: 'team', workspaceId, includeAttachments });
+                            showConversationPicker({ mode: 'team', workspaceId, includeAttachments, incremental });
                         }
                         return;
                     }
@@ -2129,7 +2177,7 @@ html.dark #gre-fab-status {
                 document.getElementById('cancel-btn').onclick = closeDialog;
             } else if (step === 'team') {
                 document.getElementById('back-btn').onclick = () => renderStep('initial');
-                const resolveWorkspaceId = () => {
+                const readSelectedWorkspaceId = () => {
                     let workspaceId = '';
                     const radioChecked = document.querySelector('input[name="workspace_id"]:checked');
                     const codeEl = document.getElementById('workspace-id-code');
@@ -2152,16 +2200,16 @@ html.dark #gre-fab-status {
                 const exportAllBtn = document.getElementById('start-team-export-btn');
                 const pickerBtn = document.getElementById('start-team-picker-btn');
                 if (exportAllBtn) exportAllBtn.onclick = () => {
-                    const workspaceId = resolveWorkspaceId();
+                    const workspaceId = readSelectedWorkspaceId();
                     if (!workspaceId) return;
                     closeDialog();
-                    startExportProcess('team', workspaceId, includeAttachments);
+                    startExportProcess('team', workspaceId, exportOptions());
                 };
                 if (pickerBtn) pickerBtn.onclick = () => {
-                    const workspaceId = resolveWorkspaceId();
+                    const workspaceId = readSelectedWorkspaceId();
                     if (!workspaceId) return;
                     closeDialog();
-                    showConversationPicker({ mode: 'team', workspaceId, includeAttachments });
+                    showConversationPicker({ mode: 'team', workspaceId, includeAttachments, incremental });
                 };
             }
         };
@@ -2183,22 +2231,15 @@ html.dark #gre-fab-status {
     }
     // @build:userscript-only-end
 
-    window.ChatGPTExporter = window.ChatGPTExporter || {};
     const previousRuntimeVersion = document.documentElement.getAttribute('data-chatgpt-exporter-version');
     if (previousRuntimeVersion !== EXPORTER_VERSION) {
         document.getElementById('export-dialog-overlay')?.remove();
     }
-    Object.assign(window.ChatGPTExporter, {
+    // 页面里的任何脚本都能访问这个对象，所以只暴露打开对话框，不暴露静默导出的入口。
+    window.ChatGPTExporter = {
         version: EXPORTER_VERSION,
-        showDialog: showExportDialog,
-        startManualExport: (mode = 'personal', workspaceId = null) => {
-            if (mode === 'project') {
-                return startProjectSpaceExportProcess(workspaceId);
-            }
-            return startExportProcess(mode, workspaceId);
-        },
-        startScheduledExport
-    });
+        showDialog: showExportDialog
+    };
 
     document.documentElement.setAttribute('data-chatgpt-exporter-ready', '1');
     document.documentElement.setAttribute('data-chatgpt-exporter-version', EXPORTER_VERSION);
@@ -2212,18 +2253,10 @@ html.dark #gre-fab-status {
         const api = window.ChatGPTExporter;
         if (!api) return;
         try {
-            switch (data.action) {
-                case 'START_SCHEDULED_EXPORT':
-                    api.startScheduledExport(data.payload || {});
-                    break;
-                case 'OPEN_DIALOG':
-                    api.showDialog();
-                    break;
-                case 'START_MANUAL_EXPORT':
-                    api.startManualExport(data.payload?.mode, data.payload?.workspaceId);
-                    break;
-                default:
-                    console.warn('[ChatGPT Exporter] 未知命令:', data.action);
+            if (data.action === 'OPEN_DIALOG') {
+                api.showDialog();
+            } else {
+                console.warn('[ChatGPT Exporter] 未知命令:', data.action);
             }
         } catch (err) {
             console.error('[ChatGPT Exporter] 处理命令失败:', err);

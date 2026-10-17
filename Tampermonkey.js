@@ -15,34 +15,6 @@
 // @updateURL    https://update.greasyfork.org/scripts/556233/ChatGPT%20Universal%20Exporter%20(Markdown%20Support).meta.js
 // ==/UserScript==
 
-/* ============================================================
-    v1.5.1 变更 (长对话与批量导出容错)
-    ------------------------------------------------------------
-    • 修复超长对话导出时 "Maximum call stack size exceeded"（对话树改为迭代遍历）
-    • Markdown 与附件只导出当前显示的分支，JSON 仍保留完整对话树
-    • 批量导出按对话隔离错误：单个对话失败不再中断整个导出，JSON 优先保存
-    • 遇到 401 / 429 时停止请求，已导出的对话照常打包下载
-    • 出现问题时 ZIP 内附 export-error-report.json，记录失败对话与阶段
-    ========================================================== */
-
-/* ============================================================
-    v1.5.0 变更 (悬浮按钮重设计)
-    ------------------------------------------------------------
-    • 宽文字按钮改为 44px 紧凑悬浮球，竖屏不再遮挡发送按钮
-    • 支持拖动到任意位置（localStorage 记忆），拖近左右边缘自动吸附
-    • 贴边后空闲 2.5 秒半隐藏为侧边把手，hover/点按展开
-    • 导出进度以环形进度 + 百分比显示在悬浮球上，明细显示在旁边状态气泡
-    • 适配深色模式；右键点击可重置位置
-    ========================================================== */
-
-/* ============================================================
-    v1.4.0 变更 (新增附件与多模态导出)
-    ------------------------------------------------------------
-    • 仅导出用户上传附件、可见图片和最终回复中的生成文件
-    • 使用 Uint8Array 写入 ZIP，避免 Blob 兼容问题
-    • 启用附件下载时生成 attachment-export-report.json 便于诊断
-    ========================================================== */
-
 (function () {
     'use strict';
 
@@ -175,8 +147,8 @@
             : `${jsonName}.md`;
     }
 
-    const ATTACHMENT_EXPORT_VERSION = '1.5.1';
-    const EXPORT_BUTTON_LABEL = `Export Conversations v${ATTACHMENT_EXPORT_VERSION}`;
+    const EXPORTER_VERSION = '1.5.1';
+    const EXPORT_BUTTON_LABEL = `Export Conversations v${EXPORTER_VERSION}`;
     const MIME_EXTENSIONS = {
         'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp',
         'application/pdf': '.pdf', 'application/zip': '.zip', 'application/json': '.json',
@@ -739,7 +711,7 @@
         if (text === EXPORT_BUTTON_LABEL) {
             if (badge) badge.textContent = '';
             pill.classList.remove('gre-visible');
-            btn.title = `ChatGPT Exporter v${ATTACHMENT_EXPORT_VERSION} · 点击导出 · 拖动移动 · 右键重置位置`;
+            btn.title = `ChatGPT Exporter v${EXPORTER_VERSION} · 点击导出 · 拖动移动 · 右键重置位置`;
             fabScheduleCollapse(btn);
             return;
         }
@@ -759,7 +731,7 @@
             btn.classList.add('gre-busy');
             if (badge) badge.textContent = '';
         }
-        btn.title = `${text} · ChatGPT Exporter v${ATTACHMENT_EXPORT_VERSION}`;
+        btn.title = `${text} · ChatGPT Exporter v${EXPORTER_VERSION}`;
         fabExpand(btn);
         pill.textContent = text;
         pill.classList.add('gre-visible');
@@ -1010,10 +982,11 @@ html.dark #gre-fab-status {
             if (saved && saved.collapsed && fabState.docked) fabCollapse(btn);
         }
         if (!btn.disabled) setFabStatus(btn, EXPORT_BUTTON_LABEL);
-        btn.dataset.exporterVersion = ATTACHMENT_EXPORT_VERSION;
+        btn.dataset.exporterVersion = EXPORTER_VERSION;
         return btn;
     }
 
+    // @build:userscript-only-start
     function initFab() {
         if (!document.body) {
             setTimeout(initFab, 200);
@@ -1021,6 +994,7 @@ html.dark #gre-fab-status {
         }
         getExportButton();
     }
+    // @build:userscript-only-end
 
     // --- 导出流程核心逻辑 ---
 
@@ -1057,7 +1031,7 @@ html.dark #gre-fab-status {
 
     function createExportErrorReport() {
         return {
-            exporter_version: ATTACHMENT_EXPORT_VERSION,
+            exporter_version: EXPORTER_VERSION,
             generated_at: new Date().toISOString(),
             succeeded: 0,
             partial: 0,
@@ -1142,7 +1116,7 @@ html.dark #gre-fab-status {
         try {
             const zip = new JSZip();
             const attachmentReport = includeAttachments ? {
-                exporter_version: ATTACHMENT_EXPORT_VERSION,
+                exporter_version: EXPORTER_VERSION,
                 generated_at: new Date().toISOString(),
                 detected: 0,
                 downloaded: 0,
@@ -2199,20 +2173,23 @@ html.dark #gre-fab-status {
     }
 
     // --- 脚本启动 ---
-    // 悬浮导出按钮：页面加载后即可见（点击导出 / 拖动移动 / 贴边半隐藏 / 右键重置）
+    // Chrome 扩展版不常驻悬浮按钮（入口是工具栏弹窗），构建时会去掉这一段；
+    // 扩展里的按钮只在导出时由 getExportButton() 按需创建，用作进度指示。
+    // @build:userscript-only-start
     if (document.body) {
         initFab();
     } else {
         document.addEventListener('DOMContentLoaded', initFab);
     }
+    // @build:userscript-only-end
 
     window.ChatGPTExporter = window.ChatGPTExporter || {};
     const previousRuntimeVersion = document.documentElement.getAttribute('data-chatgpt-exporter-version');
-    if (previousRuntimeVersion !== ATTACHMENT_EXPORT_VERSION) {
+    if (previousRuntimeVersion !== EXPORTER_VERSION) {
         document.getElementById('export-dialog-overlay')?.remove();
     }
     Object.assign(window.ChatGPTExporter, {
-        version: ATTACHMENT_EXPORT_VERSION,
+        version: EXPORTER_VERSION,
         showDialog: showExportDialog,
         startManualExport: (mode = 'personal', workspaceId = null) => {
             if (mode === 'project') {
@@ -2224,8 +2201,8 @@ html.dark #gre-fab-status {
     });
 
     document.documentElement.setAttribute('data-chatgpt-exporter-ready', '1');
-    document.documentElement.setAttribute('data-chatgpt-exporter-version', ATTACHMENT_EXPORT_VERSION);
-    console.info(`[ChatGPT Exporter] runtime v${ATTACHMENT_EXPORT_VERSION} ready`);
+    document.documentElement.setAttribute('data-chatgpt-exporter-version', EXPORTER_VERSION);
+    console.info(`[ChatGPT Exporter] runtime v${EXPORTER_VERSION} ready`);
     window.dispatchEvent(new CustomEvent('CHATGPT_EXPORTER_READY'));
 
     window.addEventListener('message', (event) => {

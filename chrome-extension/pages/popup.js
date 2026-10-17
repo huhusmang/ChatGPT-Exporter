@@ -1,12 +1,14 @@
 import { normalizeSettings, calculateNextTrigger } from '../utils/schedule.js';
 import { storage, tabs } from '../utils/chrome-helpers.js';
+import { findNewerRelease } from '../utils/update-check.js';
 
-const EXPECTED_EXPORTER_VERSION = '1.5.1';
+const EXPECTED_EXPORTER_VERSION = chrome.runtime.getManifest().version;
 
 const nextRunEl = document.getElementById('next-run');
 const reminderNoteEl = document.getElementById('reminder-note');
 const openDialogBtn = document.getElementById('open-dialog-btn');
 const openOptionsBtn = document.getElementById('open-options-btn');
+const updateNoteEl = document.getElementById('update-note');
 
 document.addEventListener('DOMContentLoaded', init);
 
@@ -17,6 +19,18 @@ async function init() {
 
     openDialogBtn.addEventListener('click', () => openDialog(normalized));
     openOptionsBtn.addEventListener('click', () => chrome.runtime.openOptionsPage());
+    renderUpdateNote();
+}
+
+async function renderUpdateNote() {
+    const release = await findNewerRelease(EXPECTED_EXPORTER_VERSION);
+    if (!release) return;
+    updateNoteEl.textContent = `发现新版本 v${release.version}（当前 v${EXPECTED_EXPORTER_VERSION}），点击查看并下载`;
+    updateNoteEl.hidden = false;
+    updateNoteEl.addEventListener('click', (event) => {
+        event.preventDefault();
+        chrome.tabs.create({ url: release.url });
+    });
 }
 
 function renderSchedule(settings) {

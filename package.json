@@ -1,0 +1,18 @@
+{
+  "name": "chatgpt-exporter",
+  "private": true,
+  "description": "Export ChatGPT conversations as JSON + Markdown ZIP backups (Tampermonkey script and Chrome extension).",
+  "license": "MIT",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test",
+    "check": "node scripts/build.mjs --check && node scripts/version.mjs check && node --test",
+    "version:set": "node scripts/version.mjs set"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0"
+  }
+}

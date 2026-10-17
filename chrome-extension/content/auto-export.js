@@ -1,7 +1,7 @@
 (function () {
     const EXPORT_READY_EVENT = 'CHATGPT_EXPORTER_READY';
     const COMMAND_TYPE = 'CHATGPT_EXPORTER_COMMAND';
-    const EXPECTED_VERSION = '1.5.1';
+    const EXPECTED_VERSION = chrome.runtime.getManifest().version;
     let exporterReady = false;
     const pendingCommands = [];
 

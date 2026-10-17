@@ -20,6 +20,21 @@ h1 {
     color: #0d9488;
 }
 
+.update-note {
+    display: block;
+    margin: 0 0 12px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: #ecfdf5;
+    color: #047857;
+    font-size: 12px;
+    text-decoration: none;
+}
+
+.update-note[hidden] {
+    display: none;
+}
+
 #schedule-state {
     background: #fff;
     border-radius: 8px;

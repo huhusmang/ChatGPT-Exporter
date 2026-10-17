@@ -1,3 +1,5 @@
+// 此文件由 scripts/build.mjs 根据 Tampermonkey.js 生成，请勿直接修改。
+
 (function () {
     'use strict';
 
@@ -48,6 +50,7 @@
         const h = typeof header === 'string' ? header : header instanceof Headers ? header.get('Authorization') : header.Authorization || header.authorization;
         if (h?.startsWith('Bearer ')) {
         const token = h.slice(7);
+        // [v8.2.0 修复] 在捕获源头增加验证，拒绝已知的无效占位符Token
         if (token && token.toLowerCase() !== 'dummy') {
             accessToken = token;
         }
@@ -129,8 +132,8 @@
             : `${jsonName}.md`;
     }
 
-    const ATTACHMENT_EXPORT_VERSION = '1.5.1';
-    const EXPORT_BUTTON_LABEL = `Export Conversations v${ATTACHMENT_EXPORT_VERSION}`;
+    const EXPORTER_VERSION = '1.5.1';
+    const EXPORT_BUTTON_LABEL = `Export Conversations v${EXPORTER_VERSION}`;
     const MIME_EXTENSIONS = {
         'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp',
         'application/pdf': '.pdf', 'application/zip': '.zip', 'application/json': '.json',
@@ -372,6 +375,7 @@
             return localPath ? `](${localPath})` : match;
         });
     }
+
 
     function cleanMessageContent(text) {
         if (!text) return '';
@@ -692,7 +696,7 @@
         if (text === EXPORT_BUTTON_LABEL) {
             if (badge) badge.textContent = '';
             pill.classList.remove('gre-visible');
-            btn.title = `ChatGPT Exporter v${ATTACHMENT_EXPORT_VERSION} · 点击导出 · 拖动移动 · 右键重置位置`;
+            btn.title = `ChatGPT Exporter v${EXPORTER_VERSION} · 点击导出 · 拖动移动 · 右键重置位置`;
             fabScheduleCollapse(btn);
             return;
         }
@@ -712,7 +716,7 @@
             btn.classList.add('gre-busy');
             if (badge) badge.textContent = '';
         }
-        btn.title = `${text} · ChatGPT Exporter v${ATTACHMENT_EXPORT_VERSION}`;
+        btn.title = `${text} · ChatGPT Exporter v${EXPORTER_VERSION}`;
         fabExpand(btn);
         pill.textContent = text;
         pill.classList.add('gre-visible');
@@ -963,9 +967,10 @@ html.dark #gre-fab-status {
             if (saved && saved.collapsed && fabState.docked) fabCollapse(btn);
         }
         if (!btn.disabled) setFabStatus(btn, EXPORT_BUTTON_LABEL);
-        btn.dataset.exporterVersion = ATTACHMENT_EXPORT_VERSION;
+        btn.dataset.exporterVersion = EXPORTER_VERSION;
         return btn;
     }
+
 
     // --- 导出流程核心逻辑 ---
 
@@ -1002,7 +1007,7 @@ html.dark #gre-fab-status {
 
     function createExportErrorReport() {
         return {
-            exporter_version: ATTACHMENT_EXPORT_VERSION,
+            exporter_version: EXPORTER_VERSION,
             generated_at: new Date().toISOString(),
             succeeded: 0,
             partial: 0,
@@ -1087,7 +1092,7 @@ html.dark #gre-fab-status {
         try {
             const zip = new JSZip();
             const attachmentReport = includeAttachments ? {
-                exporter_version: ATTACHMENT_EXPORT_VERSION,
+                exporter_version: EXPORTER_VERSION,
                 generated_at: new Date().toISOString(),
                 detected: 0,
                 downloaded: 0,
@@ -2143,14 +2148,17 @@ html.dark #gre-fab-status {
         renderStep('initial');
     }
 
+    // --- 脚本启动 ---
+    // Chrome 扩展版不常驻悬浮按钮（入口是工具栏弹窗），构建时会去掉这一段；
+    // 扩展里的按钮只在导出时由 getExportButton() 按需创建，用作进度指示。
 
     window.ChatGPTExporter = window.ChatGPTExporter || {};
     const previousRuntimeVersion = document.documentElement.getAttribute('data-chatgpt-exporter-version');
-    if (previousRuntimeVersion !== ATTACHMENT_EXPORT_VERSION) {
+    if (previousRuntimeVersion !== EXPORTER_VERSION) {
         document.getElementById('export-dialog-overlay')?.remove();
     }
     Object.assign(window.ChatGPTExporter, {
-        version: ATTACHMENT_EXPORT_VERSION,
+        version: EXPORTER_VERSION,
         showDialog: showExportDialog,
         startManualExport: (mode = 'personal', workspaceId = null) => {
             if (mode === 'project') {
@@ -2162,10 +2170,8 @@ html.dark #gre-fab-status {
     });
 
     document.documentElement.setAttribute('data-chatgpt-exporter-ready', '1');
-    document.documentElement.setAttribute('data-chatgpt-exporter-version', ATTACHMENT_EXPORT_VERSION);
-    // Chrome 扩展不主动创建悬浮按钮（用户通过工具栏弹窗触发导出）；
-    // 按钮仅在导出流程中由 getExportButton() 按需创建，作为进度指示
-    console.info(`[ChatGPT Exporter] runtime v${ATTACHMENT_EXPORT_VERSION} ready`);
+    document.documentElement.setAttribute('data-chatgpt-exporter-version', EXPORTER_VERSION);
+    console.info(`[ChatGPT Exporter] runtime v${EXPORTER_VERSION} ready`);
     window.dispatchEvent(new CustomEvent('CHATGPT_EXPORTER_READY'));
 
     window.addEventListener('message', (event) => {

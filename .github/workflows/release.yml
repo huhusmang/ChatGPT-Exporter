@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 jobs:
   release:
@@ -13,12 +12,25 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Verify build, version and tests
+        run: |
+          node scripts/build.mjs --check
+          node scripts/version.mjs check --tag "$GITHUB_REF_NAME"
+          node --test
+      - name: Extract release notes
+        run: node scripts/version.mjs notes "$GITHUB_REF_NAME" > RELEASE_NOTES.md
       - name: Package chrome extension
         run: |
           zip -r ChatGPT-Exporter.zip chrome-extension
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: RELEASE_NOTES.md
           files: |
             ChatGPT-Exporter.zip
             Tampermonkey.js

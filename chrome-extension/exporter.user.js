@@ -126,7 +126,7 @@
             : `${jsonName}.md`;
     }
 
-    const EXPORTER_VERSION = '1.5.1';
+    const EXPORTER_VERSION = '1.6.0';
     const EXPORT_BUTTON_LABEL = `Export Conversations v${EXPORTER_VERSION}`;
     const MIME_EXTENSIONS = {
         'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp',
